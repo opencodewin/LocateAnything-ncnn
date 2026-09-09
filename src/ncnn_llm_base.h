@@ -153,6 +153,11 @@ protected:
         opt.num_threads = num_threads_;
         opt.use_bf16_storage = false;
         opt.use_vulkan_compute = use_vulkan_;
+        // NCNN defaults all fp16 options to true, so fp32 must explicitly clear
+        // them before enabling the requested Vulkan precision.
+        opt.use_fp16_packed = false;
+        opt.use_fp16_storage = false;
+        opt.use_fp16_arithmetic = false;
         // fp16 仅作用于 Vulkan 计算链路（视觉链与 CPU 副本在 load_net 里强制回 fp32）。
         if (use_fp16_) {
             opt.use_fp16_packed = true;

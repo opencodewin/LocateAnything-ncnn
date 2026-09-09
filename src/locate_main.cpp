@@ -46,7 +46,6 @@ int main(int argc, char** argv) {
             if (vulkan_device < 0) vulkan_device = 0;
         }
         else if (arg == "--fp16") use_fp16 = true;
-        else if (arg == "--fp32") use_fp16 = false;
         else if (arg == "--greedy") greedy = true;
         else if (arg == "--max-new-tokens" && i + 1 < args.size()) {
             max_new = std::stoi(args[++i]);
@@ -62,7 +61,7 @@ int main(int argc, char** argv) {
 
     if (image_path.empty()) {
         fprintf(stderr, "Usage: %s --image <image_path> [--model <model_path>] [--prompt <question>]\n"
-                        "       [--vulkan] [--vulkan-device <idx>] [--fp16|--fp32] [--threads N]\n"
+                        "       [--vulkan] [--vulkan-device <idx>] [--fp16] [--threads N]\n"
                         "       [--save <out.png>] [--no-draw]\n",
                 argv[0]);
         return 1;

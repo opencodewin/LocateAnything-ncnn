@@ -52,7 +52,7 @@ cmake --build build
 ```
 选项：
 - `--vulkan`：文本链路走 Vulkan GPU；`--vulkan-device <idx>`：多 GPU 时指定设备序号（启动时会列出所有可用设备及编号；越界自动回退 0）。
-- `--fp16` / `--fp32`：推理精度（默认 fp32）。`--fp16` 仅作用于 Vulkan 文本链路，视觉链与 CPU 路径恒为 fp32，避免污染视觉特征 / CPU 无 FP16 硬件的回退。
+- `--fp16`：推理精度（默认 fp32）。`--fp16` 仅作用于 Vulkan 文本链路，视觉链与 CPU 路径恒为 fp32，避免污染视觉特征 / CPU 无 FP16 硬件的回退。
 - `--threads N`、`--greedy`、`--max-new-tokens N` 同前。
 - `--save <out.png>`：把检测框画到原图上并保存（默认写到 `<image>_locate.png`）；`--no-draw` 关闭保存。
 
