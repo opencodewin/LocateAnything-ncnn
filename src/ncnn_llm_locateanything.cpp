@@ -688,6 +688,9 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
     auto emit = [&](const std::vector<int>& toks) {
         for (int t : toks) {
             std::string d = bpe_->decode({t}, true);
+            // special token（<box>/<0>~<1000>/...）decode 会跳过 -> 兜底渲染成结构化文本，
+            // 否则生成输出里看不到任何坐标。
+            if (d.empty()) d = structured_token_text(t);
             if (cfg.callback) cfg.callback(d);
             out_text += d;
         }
@@ -803,6 +806,7 @@ void ncnn_llm_locateanything::decode_loop_ar(std::string& out_text, std::vector<
     auto emit = [&](const std::vector<int>& toks) {
         for (int t : toks) {
             std::string d = bpe_->decode({t}, true);
+            if (d.empty()) d = structured_token_text(t);   // 结构 token 兜底渲染（同 MTP）
             if (cfg.callback) cfg.callback(d);
             out_text += d;
         }
@@ -923,6 +927,60 @@ ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
 }
 
 // ============================================================================
+// 结构化坐标输出：把 <box>/</box>/<0>~<1000> 等 special token 渲染成可见文本
+// ============================================================================
+std::string ncnn_llm_locateanything::structured_token_text(int id) const {
+    if (id == box_start_id_) return "<box>";
+    if (id == box_end_id_) return "</box>";
+    if (id >= coord_start_id_ && id <= coord_end_id_)
+        return "<" + std::to_string(id - coord_start_id_) + ">";
+    if (id == ref_start_id_) return "<ref>";
+    if (id == ref_end_id_) return "</ref>";
+    if (id == null_id_) return "<null>";
+    if (id == im_end_id_) return "<|im_end|>";
+    return std::string();
+}
+
+// 从生成段 token 里解析 <box>[c1 c2 c3 c4]</box> / <box>[c1 c2]</box>（点框）。
+// 坐标 token 区间 [coord_start, coord_end] 对应 0~1000 的量化值。
+void ncnn_llm_locateanything::collect_boxes(const std::vector<int>& ids, size_t prompt_len) {
+    last_boxes_.clear();
+    auto is_coord = [&](int t) { return t >= coord_start_id_ && t <= coord_end_id_; };
+    size_t i = prompt_len;
+    while (i < ids.size()) {
+        if (ids[i] != box_start_id_) { i++; continue; }
+        size_t j = i + 1;
+        std::vector<int> cs;
+        while (j < ids.size() && is_coord(ids[j]) && cs.size() < 4) cs.push_back(ids[j++]);
+        if (j < ids.size() && ids[j] == box_end_id_ && (cs.size() == 4 || cs.size() == 2)) {
+            LocateBox b;
+            if (cs.size() == 4) {
+                b.x1 = (cs[0] - coord_start_id_) / 1000.f;
+                b.y1 = (cs[1] - coord_start_id_) / 1000.f;
+                b.x2 = (cs[2] - coord_start_id_) / 1000.f;
+                b.y2 = (cs[3] - coord_start_id_) / 1000.f;
+            } else {
+                const float cx = (cs[0] - coord_start_id_) / 1000.f;
+                const float cy = (cs[1] - coord_start_id_) / 1000.f;
+                const float r = 0.01f;      // 点框画成 ±1% 的小方块
+                b.x1 = cx - r; b.y1 = cy - r; b.x2 = cx + r; b.y2 = cy + r;
+                b.is_point = true;
+            }
+            if (b.x1 > b.x2) std::swap(b.x1, b.x2);
+            if (b.y1 > b.y2) std::swap(b.y1, b.y2);
+            b.x1 = std::min(1.f, std::max(0.f, b.x1));
+            b.y1 = std::min(1.f, std::max(0.f, b.y1));
+            b.x2 = std::min(1.f, std::max(0.f, b.x2));
+            b.y2 = std::min(1.f, std::max(0.f, b.y2));
+            last_boxes_.push_back(b);
+            i = j + 1;
+            continue;
+        }
+        i++;
+    }
+}
+
+// ============================================================================
 // 端到端 grounding
 // ============================================================================
 std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::string& question,
@@ -1016,6 +1074,9 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
         decode_loop_mtp(out_text, ids, kv, cfg, history);
     else
         decode_loop_ar(out_text, ids, kv, cfg, history);
+
+    // 7) 从生成 token 解析检测框（归一化 [0,1]），供调用方打印/画框。
+    collect_boxes(ids, (size_t)S);
     return out_text;
 }
 

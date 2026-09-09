@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "ncnn_llm_locateanything.h"
+#include "utils/draw_utils.h"
 #include "utils/image_utils.h"
 #include "utf8_args.h"
 
@@ -14,6 +15,7 @@
 // 用法:
 //   bench_platform --image <img> [--model <dir>] [--prompt <q>]
 //                  [--threads N] [--vulkan-device <idx>] [--iter N]
+//                  [--save-dir <dir>]  每个配置把带框标注图写到 <dir>/<label>.png
 
 namespace {
 
@@ -64,6 +66,7 @@ int main(int argc, char** argv) {
     int iters = 3;
     bool use_mtp = true;
     bool cpu_only = false;
+    std::string save_dir;
 
     for (size_t i = 1; i < args.size(); i++) {
         const std::string& a = args[i];
@@ -86,13 +89,16 @@ int main(int argc, char** argv) {
         } else if (a == "--iter" && i + 1 < args.size()) {
             iters = std::stoi(args[++i]);
             if (iters <= 0) iters = 1;
+        } else if (a == "--save-dir" && i + 1 < args.size()) {
+            save_dir = args[++i];
         }
     }
 
     if (image_path.empty()) {
         fprintf(stderr,
             "Usage: %s --image <img> [--model <dir>] [--prompt <q>]\n"
-            "       [--threads N] [--vulkan-device <idx>] [--max-new-tokens N] [--no-mtp] [--iter N]\n",
+            "       [--threads N] [--vulkan-device <idx>] [--max-new-tokens N] [--no-mtp] [--iter N]\n"
+            "       [--save-dir <dir>]\n",
             argv[0]);
         return 2;
     }
@@ -124,6 +130,7 @@ int main(int argc, char** argv) {
         if (cpu_only && c.vulkan) continue;   // --cpu-only：跳过已知错误的 GPU 路径
         printf("--- %s ---\n", c.label);
         std::string out;
+        std::vector<LocateBox> boxes;
         std::chrono::duration<double> elapsed(0);
         {
             ncnn_llm_locateanything la(model_path, c.vulkan, threads, vulkan_device, c.fp16);
@@ -137,10 +144,24 @@ int main(int argc, char** argv) {
             for (int i = 0; i < iters; i++) out = la.run(bgr, prompt, cfg);
             auto t1 = std::chrono::steady_clock::now();
             elapsed = t1 - t0;
+            boxes = la.last_boxes();
         }  // la 析构，释放模型/显存后再跑下一个配置
 
         const double avg = elapsed.count() / iters;
         printf("  end-to-end avg=%.3f s  (total=%.3f s / %d iter)\n", avg, elapsed.count(), iters);
+
+        // 检测坐标（归一化 + 像素）
+        printf("  boxes=%zu\n", boxes.size());
+        for (size_t i = 0; i < boxes.size(); i++) {
+            printf("    %s\n", format_locate_box(boxes[i], bgr.w, bgr.h, (int)i).c_str());
+        }
+        if (!save_dir.empty()) {
+            std::string p = save_dir;
+            if (p.back() != '/' && p.back() != '\\') p += "/";
+            p += std::string(c.label) + ".png";
+            if (draw_locate_boxes(bgr, boxes, p)) printf("  annotated: %s\n", p.c_str());
+            else fprintf(stderr, "  failed to write annotated image: %s\n", p.c_str());
+        }
 
         if (!have_ref) {
             ref_text = out;

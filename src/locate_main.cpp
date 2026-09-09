@@ -2,6 +2,7 @@
 #include <string>
 #include <vector>
 #include "ncnn_llm_locateanything.h"
+#include "utils/draw_utils.h"
 #include "utils/image_utils.h"
 #include "utf8_args.h"
 
@@ -13,7 +14,9 @@
 //
 // 用法:
 //   locate_main --model <models-dir> --image <image> [--prompt <question>] [--vulkan] [--threads N]
+//               [--save <out.png>] [--no-draw]
 //   （--model 默认 models/locate-anything-fp16，--image 必填）
+// 默认会把带框的图标注结果写到 <image>_locate.png（--save 指定路径，--no-draw 关闭）。
 
 int main(int argc, char** argv) {
     enable_utf8_console();
@@ -29,6 +32,8 @@ int main(int argc, char** argv) {
     int vulkan_device = 0;
     int threads = 4;
     int max_new = 512;
+    std::string save_path;
+    bool draw = true;
 
     for (size_t i = 1; i < args.size(); i++) {
         const std::string& arg = args[i];
@@ -51,11 +56,14 @@ int main(int argc, char** argv) {
             threads = std::stoi(args[++i]);
             if (threads <= 0) threads = 4;
         }
+        else if (arg == "--save" && i + 1 < args.size()) save_path = args[++i];
+        else if (arg == "--no-draw") draw = false;
     }
 
     if (image_path.empty()) {
         fprintf(stderr, "Usage: %s --image <image_path> [--model <model_path>] [--prompt <question>]\n"
-                        "       [--vulkan] [--vulkan-device <idx>] [--fp16|--fp32] [--threads N]\n",
+                        "       [--vulkan] [--vulkan-device <idx>] [--fp16|--fp32] [--threads N]\n"
+                        "       [--save <out.png>] [--no-draw]\n",
                 argv[0]);
         return 1;
     }
@@ -99,6 +107,25 @@ int main(int argc, char** argv) {
 
     std::string out = la.run(bgr, prompt, cfg);
     fprintf(stderr, "\n");
-    printf("\n\nDone.\n");
+
+    // 结构化输出：模型原始文本（含 <box><x1><y1><x2><y2></box>）+ 解析后的坐标
+    printf("\nRaw output: %s\n", out.c_str());
+
+    const std::vector<LocateBox>& boxes = la.last_boxes();
+    printf("Detected %zu box(es) on %dx%d image:\n", boxes.size(), bgr.w, bgr.h);
+    for (size_t i = 0; i < boxes.size(); i++) {
+        printf("  %s\n", format_locate_box(boxes[i], bgr.w, bgr.h, (int)i).c_str());
+    }
+
+    // 在原图标注并保存
+    if (draw) {
+        const std::string out_png = save_path.empty() ? default_annotated_path(image_path) : save_path;
+        if (draw_locate_boxes(bgr, boxes, out_png))
+            printf("Annotated image saved: %s\n", out_png.c_str());
+        else
+            fprintf(stderr, "Failed to save annotated image: %s\n", out_png.c_str());
+    }
+
+    printf("\nDone.\n");
     return 0;
 }

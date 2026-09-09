@@ -11,6 +11,7 @@
 #include <nlohmann/json.hpp>
 
 #include "ncnn_llm_base.h"
+#include "utils/draw_utils.h"
 #include "utils/tokenizer/bpe_tokenizer.h"
 
 // LocateAnything-3B 的 ncnn_llm 补充实现（grounding VLM）。
@@ -56,9 +57,14 @@ public:
     const std::string& model_type() const { return model_type_; }
 
     // 端到端 grounding：rgb_image 为 load_image_to_ncnn_mat 的结果（BGR u8 interleaved），
-    // question 为自然语言 query/指令。返回模型生成的原始文本。
+    // question 为自然语言 query/指令。返回模型生成的原始文本（含 <box><x1><y1><x2><y2></box>
+    // 结构化坐标 token，坐标量化到 0~1000）。
     std::string run(const ncnn::Mat& bgr_image, const std::string& question,
                     const LocateGenerateConfig& cfg);
+
+    // 上一次 run 解析出的检测框（归一化 [0,1]，相对原图宽高）。
+    // 直接由生成的 token id 解析，不依赖文本渲染，最可靠。
+    const std::vector<LocateBox>& last_boxes() const { return last_boxes_; }
 
 private:
     void text_rope_cos_sin(int seq, int pos_start, ncnn::Mat& cos, ncnn::Mat& sin);
@@ -73,6 +79,12 @@ private:
                           const ncnn::Mat& mask, KVCache& kv, bool is_prefill);
     ncnn::Mat run_lm_head(const ncnn::Mat& hidden);
     bool load_pos_emb(const std::string& path);
+    // 结构 token（<box>/</box>/<0>~<1000>/<ref>/...）的文本渲染；非结构 token 返回空串。
+    // 这些 token 在 tokenizer 里属于 special，decode 会跳过，导致生成文本里看不到坐标，
+    // 故在此兜底渲染，使输出文本可被 parse_locate_boxes_text 直接解析。
+    std::string structured_token_text(int id) const;
+    // 从生成段（prompt 之后）的 token id 里解析 <box>..</box>，结果写入 last_boxes_。
+    void collect_boxes(const std::vector<int>& ids, size_t prompt_len);
     // 宿主端动态视觉（v3）：网络按实际网格任意喂，pos_emb 用原生 64x64 权重做
     // torch 语义的 bicubic（align_corners=False）插值，patch_merger 移到宿主。
     void host_bicubic_pos_emb(int grid_h, int grid_w, ncnn::Mat& out);  // out=[gh*gw, dim]
@@ -162,4 +174,6 @@ private:
     int vision_head_dim_ = 72;
     double vision_rope_theta_ = 10000.0;
     int n_image_tokens_ = 256;      // run_vision_features 内按 (gh/merge)*(gw/merge) 更新
+
+    std::vector<LocateBox> last_boxes_;   // 最近一次 run 解析出的检测框（归一化）
 };

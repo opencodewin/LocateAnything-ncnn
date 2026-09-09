@@ -48,6 +48,15 @@ cmake --build build
 - `--vulkan`：文本链路走 Vulkan GPU；`--vulkan-device <idx>`：多 GPU 时指定设备序号（启动时会列出所有可用设备及编号；越界自动回退 0）。
 - `--fp16` / `--fp32`：推理精度（默认 fp32）。`--fp16` 仅作用于 Vulkan 文本链路，视觉链与 CPU 路径恒为 fp32，避免污染视觉特征 / CPU 无 FP16 硬件的回退。
 - `--threads N`、`--greedy`、`--max-new-tokens N` 同前。
+- `--save <out.png>`：把检测框画到原图上并保存（默认写到 `<image>_locate.png`）；`--no-draw` 关闭保存。
+
+输出中除模型原始文本（含 `<box><x1><y1><x2><y2></box>` 结构化坐标 token）外，还会逐框打印归一化坐标与像素坐标，例如：
+```
+Raw output: <box><120><80><600><900></box>...
+Detected 2 box(es) on 1280x720 image:
+  #0 norm=(0.1200,0.0800)-(0.6000,0.9000) px=(154,58)-(768,648) size=615x591
+```
+归一化坐标 × 原图宽/高即像素坐标（`src/utils/draw_utils.h`：`parse_locate_boxes_text` / `draw_locate_boxes`）。
 
 ## 平台测试
 `bench_platform` 在同一输入下按 **cpu-fp32 → gpu-fp32 → gpu-fp16** 顺序运行，统计各平台端到端耗时（`end-to-end avg`），并以 **cpu-fp32 输出为参考**衡量其它平台文本一致性（归一化 Levenshtein，1 = 与参考完全一致）。使用 greedy 确定性解码，保证跨平台可比；每平台先 warmup 1 次（不计时）再测 N 次。
@@ -68,7 +77,7 @@ cmake --build build
    ```bash
    ./bench_platform --image ../datas/football.jpg --prompt human --iter 3
    ```
-   可选：`--threads N`、`--max-new-tokens N`、`--vulkan-device <idx>`、`--no-mtp`（纯逐 token AR 解码）、`--cpu-only`（只跑 CPU，跳过已知不可用的 Vulkan）。
+   可选：`--threads N`、`--max-new-tokens N`、`--vulkan-device <idx>`、`--no-mtp`（纯逐 token AR 解码）、`--cpu-only`（只跑 CPU，跳过已知不可用的 Vulkan）、`--save-dir <dir>`（每个配置各存一张带框标注图 `<label>.png`）。
 4. **解读结果**：
    - **耗时**：各平台 `end-to-end avg`，对比不同计算后端/精度的吞吐。
    - **一致性**：参考平台之外的 `sim(vs cpu-fp32)` 与 `identical`；接近 1 表示与 CPU fp32 输出一致，接近 0 表示发散（例如本仓库 macOS 上两个 Vulkan 配置都只有约 4.6%）。

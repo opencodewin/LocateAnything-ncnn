@@ -92,6 +92,7 @@ target_include_directories(nlohmann_json_iface INTERFACE ${CMAKE_CURRENT_SOURCE_
 add_library(locate_anything STATIC
     src/ncnn_llm_locateanything.cpp
     src/utils/image_utils.cpp
+    src/utils/draw_utils.cpp
     src/utils/tokenizer/bpe_tokenizer.cpp
 )
 target_include_directories(locate_anything PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
