@@ -18,7 +18,57 @@
 - **AMD CPU（Linux）实测：无任何输出**（一个框都解不出来；同样的 x86 代码路径在 Windows Intel CPU 上正常）。
   - 已排除的方向：`patches/` 的 RoPE 补丁对本工程输入在 CPU 上是 no-op（见上），不是根因；差异更可能来自编译器 / 运行时 ISA 分派（GCC vs MSVC、是否启用 AVX512）或 ncnn 在该架构返回 packed Mat（`elempack=4/8`）。
   - 排查手段：运行时会打印各子图输出的 `SHAPE ... pack=N`（非 1 时会额外打印 `NOTE ... unpack packN -> pack1`）、视觉特征统计 `DEBUG feat`、以及跨平台指纹 `FEATSUM` / `PREFILL top5 logits`；`LA_DUMP_VISION=<path>` / `LA_DUMP_TEXT=<prefix>` 可 dump fp32 特征逐元素对比。宿主侧已对所有子图输出做"解包 + 摊平成规范 2D"处理（`la_canonical_2d` / `la_canonical_kv`），可排除 packed Mat 解释错位这一类问题。
-  - 若怀疑 AVX512 kernel：用 `-DNCNN_AVX512=OFF` 重编做二分别。
+  - 若怀疑 AVX512 kernel：使用下面的独立构建目录重编做二分。不要复用已有 `build` 目录，否则 CMakeCache 可能保留原来的 ISA 开关。
+
+### AMD CPU ISA 隔离
+
+先关闭 AVX512，确认问题是否来自 AMD 的 AVX512 专用 kernel：
+
+```bash
+cmake -G Ninja -B build-amd-no-avx512 -S . \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLOCATE_NCNN_VULKAN=OFF \
+  -DNCNN_AVX512=OFF \
+  -DNCNN_AVX512FP16=OFF \
+  -DNCNN_AVX512BF16=OFF \
+  -DNCNN_AVX512VNNI=OFF
+cmake --build build-amd-no-avx512
+```
+
+使用与原构建完全相同的模型、图片、prompt、线程数和 token 数运行：
+
+```bash
+./build-amd-no-avx512/locate_main \
+  --model <fp32模型目录> \
+  --image datas/football.jpg \
+  --prompt human \
+  --max-new-tokens 20 \
+  --threads 6 \
+  --no-draw
+```
+
+如果仍然错误，再关闭所有高级 x86 ISA，建立 generic CPU 对照：
+
+```bash
+cmake -G Ninja -B build-amd-generic -S . \
+  -DCMAKE_BUILD_TYPE=Release \
+  -DLOCATE_NCNN_VULKAN=OFF \
+  -DNCNN_RUNTIME_CPU=OFF \
+  -DNCNN_AVX=OFF \
+  -DNCNN_AVX2=OFF \
+  -DNCNN_AVX512=OFF \
+  -DNCNN_FMA=OFF \
+  -DNCNN_FMA4=OFF \
+  -DNCNN_F16C=OFF
+cmake --build build-amd-generic
+```
+
+对比两种构建的 `DEBUG feat`、`FEATSUM`、`PREFILL top5 logits` 和 `Raw output`：
+
+- generic 版本恢复正常：问题在 ncnn 的 x86 ISA kernel 或运行时分派，优先继续在 AVX512、AVX2、FMA 之间二分。
+- `FEATSUM` 已不同：问题发生在 vision_embed / vision_encoder / vision_projector 或视觉 RoPE。
+- `FEATSUM` 一致但 `PREFILL top5 logits` 不同：问题发生在 text_embed / text_decoder / lm_head。
+- 两种构建都错误：问题不太可能只是 ISA kernel，应继续比较编译器、模型文件和 `LA_DUMP_VISION` / `LA_DUMP_TEXT` 的逐元素 dump。
 
 ## 目录结构
 ```
