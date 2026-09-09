@@ -1,0 +1,93 @@
+#include <iostream>
+#include <string>
+#include <vector>
+#include "ncnn_llm_locateanything.h"
+#include "utils/image_utils.h"
+#include "utf8_args.h"
+
+// LocateAnything-3B grounding CLI（ncnn_llm 补充实现）。
+//
+// 端到端跑 universal 导出的 fp16 六子图：
+//   图片 + 自然语言 query -> <box><x1><y1><x2><y2></box> 结构化坐标 token。
+// 这是 VLM 目标定位（grounding），不是 OCR 文字识别。
+//
+// 用法:
+//   locate_main --model <models-dir> --image <image> [--prompt <question>] [--vulkan] [--threads N]
+//   （--model 默认 models/locate-anything-fp16，--image 必填）
+
+int main(int argc, char** argv) {
+    enable_utf8_console();
+    std::vector<std::string> args = get_utf8_args(argc, argv);
+
+    std::string model_path = "models/locate-anything-fp16";
+    std::string image_path;
+    std::string prompt;
+    bool prompt_set = false;
+    bool use_vulkan = false;
+    bool greedy = false;
+    int threads = 4;
+    int max_new = 512;
+
+    for (size_t i = 1; i < args.size(); i++) {
+        const std::string& arg = args[i];
+        if (arg == "--model" && i + 1 < args.size()) model_path = args[++i];
+        else if (arg == "--image" && i + 1 < args.size()) image_path = args[++i];
+        else if (arg == "--prompt" && i + 1 < args.size()) { prompt = args[++i]; prompt_set = true; }
+        else if (arg == "--vulkan") use_vulkan = true;
+        else if (arg == "--greedy") greedy = true;
+        else if (arg == "--max-new-tokens" && i + 1 < args.size()) {
+            max_new = std::stoi(args[++i]);
+            if (max_new <= 0) max_new = 512;
+        }
+        else if (arg == "--threads" && i + 1 < args.size()) {
+            threads = std::stoi(args[++i]);
+            if (threads <= 0) threads = 4;
+        }
+    }
+
+    if (image_path.empty()) {
+        fprintf(stderr, "Usage: %s --image <image_path> [--model <model_path>] [--prompt <question>] [--vulkan]\n",
+                argv[0]);
+        return 1;
+    }
+
+    printf("Loading LocateAnything model from %s (threads=%d, vulkan=%s)\n",
+           model_path.c_str(), threads, use_vulkan ? "on" : "off");
+
+    ncnn_llm_locateanything la(model_path, use_vulkan, threads);
+    if (!la.ok()) {
+        fprintf(stderr, "Failed to load LocateAnything model\n");
+        return 1;
+    }
+
+    // 默认 grounding 指令：让模型把图中所有目标都用 box 标出。
+    // 用户可用 --prompt 覆盖成更具体的 query。
+    if (!prompt_set) {
+        prompt = "Where is the object?";
+    }
+
+    printf("Loading image: %s\n", image_path.c_str());
+    ncnn::Mat bgr = load_image_to_ncnn_mat(image_path);
+    if (ncnn_mat_empty(bgr)) {
+        fprintf(stderr, "Failed to load image: %s\n", image_path.c_str());
+        return 1;
+    }
+
+    LocateGenerateConfig cfg;
+    cfg.max_new_tokens = max_new;
+    cfg.do_sample = !greedy;   // --greedy 关闭采样，确定性 argmax（用于与 torch 逐 token 对比定位）
+    cfg.temperature = 0.7f;
+    cfg.top_p = 0.9f;
+    cfg.top_k = 50;
+    cfg.repetition_penalty = greedy ? 1.0f : 1.1f;   // greedy 时关掉 rep/采样，纯净 argmax
+    // 逐 token 打印到 stderr，便于实时观察 decode 进度（stdout 块缓冲看不动）
+    cfg.callback = [](const std::string& t) { fprintf(stderr, "%s", t.c_str()); fflush(stderr); };
+
+    printf("Grounding with prompt: %s\n", prompt.c_str());
+    printf("Generating:\n");
+
+    std::string out = la.run(bgr, prompt, cfg);
+    fprintf(stderr, "\n");
+    printf("\n\nDone.\n");
+    return 0;
+}

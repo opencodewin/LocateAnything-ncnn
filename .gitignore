@@ -1,0 +1,12 @@
+﻿# build artifacts
+/build*/
+/.cache/
+compile_commands.json
+*.exe
+*.dll
+*.a
+*.lib
+*.obj
+*.o
+# model dirs are kept external (referenced via --model)
+/models/
