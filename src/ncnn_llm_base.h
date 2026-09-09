@@ -136,6 +136,10 @@ protected:
                         vulkan_device_);
                 vulkan_device_ = 0;
             }
+            if (use_fp16_ && cnt > 0 && !ncnn::get_gpu_info(vulkan_device_).support_fp16_arithmetic()) {
+                fprintf(stderr, "[ncnn] WARNING: selected Vulkan device does not support FP16 arithmetic; "
+                                "fp16 storage may be used, but computation falls back from native FP16\n");
+            }
         }
 #endif
     }
@@ -168,6 +172,7 @@ protected:
         if (use_vulkan_) {
             // 绑定到指定 Vulkan 设备（多 GPU 时由 --vulkan-device 决定）。
             // VulkanDevice 仅暴露 blob/staging 两个 allocator，workspace 复用 blob。
+            opt.vulkan_device_index = vulkan_device_;
             ncnn::VulkanDevice* gpu = ncnn::get_gpu_device(vulkan_device_);
             opt.blob_vkallocator = gpu->acquire_blob_allocator();
             opt.staging_vkallocator = gpu->acquire_staging_allocator();

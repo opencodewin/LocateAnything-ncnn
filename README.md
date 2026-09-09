@@ -70,6 +70,39 @@ cmake --build build-amd-generic
 - `FEATSUM` 一致但 `PREFILL top5 logits` 不同：问题发生在 text_embed / text_decoder / lm_head。
 - 两种构建都错误：问题不太可能只是 ISA kernel，应继续比较编译器、模型文件和 `LA_DUMP_VISION` / `LA_DUMP_TEXT` 的逐元素 dump。
 
+### Vulkan SDPA 与大显存验证
+
+GTX 1080 Ti 的 Vulkan 能力通常显示为 `fp16-p/s/u/a=1/1/1/0`：可以使用 FP16 storage，
+但不支持原生 FP16 arithmetic。项目会保留 FP16 storage 以降低显存占用，并通过
+`patches/6100_sdpa_no_flash_without_fp16_arithmetic.patch` 在该类设备上禁用 Flash Attention，
+回退到普通 SDPA。普通 SDPA 的中间缓冲区更大，建议在显存较大的 GPU 上验证：
+
+```bash
+cmake -G Ninja -B build-vulkan-test -S . -DCMAKE_BUILD_TYPE=Release
+cmake --build build-vulkan-test --target locate_main
+LA_SELFTEST=1 ./build-vulkan-test/locate_main \
+  --model <fp16模型目录> \
+  --image datas/football.jpg \
+  --prompt human \
+  --max-new-tokens 1 \
+  --threads 1 \
+  --vulkan \
+  --vulkan-device 0 \
+  --fp16 \
+  --greedy \
+  --no-draw
+```
+
+重点观察：`selfcheck decoder_prefill maxdiff`。视觉链的三个 `maxdiff` 应接近 0；
+若 decoder 的差异明显下降，说明原问题来自不支持原生 FP16 arithmetic 的 Flash Attention 路径。
+`LA_TEXT_ONLY=1` 可跳过视觉链，仅测试 text_embed、text_decoder 和 lm_head：
+
+```bash
+LA_TEXT_ONLY=1 LA_SELFTEST=1 ./build-vulkan-test/locate_main \
+  --model <fp16模型目录> --image datas/football.jpg --prompt human \
+  --max-new-tokens 1 --threads 1 --vulkan --vulkan-device 0 --fp16 --greedy --no-draw
+```
+
 ## 目录结构
 ```
 3rdparty/ncnn   # git submodule：ncnn 源码（构建时会自动应用 patches/ 下的补丁）

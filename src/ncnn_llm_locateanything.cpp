@@ -1113,11 +1113,13 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
                                          const LocateGenerateConfig& cfg) {
     if (!ok_) return std::string();
     std::string out_text;
+    const bool text_only = std::getenv("LA_TEXT_ONLY") != nullptr &&
+                           std::getenv("LA_TEXT_ONLY")[0] != '0';
 
     // 1) 视觉特征
     ncnn::Mat image_features;
-    run_vision_features(bgr_image, image_features);
-    {
+    if (!text_only) {
+        run_vision_features(bgr_image, image_features);
         const float* fp = image_features;
         float mn = 1e30f, mx = -1e30f, sm = 0.f;
         int n = image_features.w * image_features.h;
@@ -1129,9 +1131,11 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
         }
         fprintf(stderr, "[locateanything] DEBUG feat w=%d h=%d min=%.3f max=%.3f mean=%.4f\n",
                 image_features.w, image_features.h, mn, mx, sm / std::max(1, n));
+    } else {
+        fprintf(stderr, "[locateanything] LA_TEXT_ONLY=1: skip vision chain\n");
     }
 
-    // 2) 拼 prompt：system/user + 256 <IMG_CONTEXT> + question + assistant
+    // 2) 拼 prompt：system/user + optional image context + question + assistant
     //    与 torch 的 _tokenize 完全一致：user 文本=_PROMPT + question + "."（见
     //    batch_utils/hybrid_runtime.py:1795）。早期版本漏了英文 grounding 指令前缀
     //    与句号，导致解码器所见 prompt 与 torch 不同，输出分叉（多余框/截断身体）。
@@ -1145,21 +1149,25 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     // prompt 与 torch 不同，影响终止/多余框）。
     std::string prompt =
         "<|im_start|>system\nYou are a helpful assistant.\n<|im_end|>\n"
-        "<|im_start|>user\n" + img_ph;
-    for (int i = 0; i < n_image_tokens_; i++) prompt += img_ctx;
-    prompt += img_ph_end + user_text + "<|im_end|>\n<|im_start|>assistant\n";
+        "<|im_start|>user\n";
+    if (!text_only) {
+        prompt += img_ph;
+        for (int i = 0; i < n_image_tokens_; i++) prompt += img_ctx;
+        prompt += img_ph_end;
+    }
+    prompt += user_text + "<|im_end|>\n<|im_start|>assistant\n";
 
     std::vector<int> ids = bpe_->encode(prompt);
     const int S = (int)ids.size();
 
-    // 3) 找到 image token 的位置（应为连续的 n_image_tokens_ 个）
+    // 3) 找到 image token 的位置（text-only 模式不应包含 image token）
     std::vector<int> img_pos;
     for (int i = 0; i < S; i++) {
         if (ids[i] == image_token_id_) img_pos.push_back(i);
     }
     printf("[locateanything] prompt seq=%d imgs=%d (expect %d)\n", S, (int)img_pos.size(),
-           n_image_tokens_);
-    if ((int)img_pos.size() != n_image_tokens_) {
+           text_only ? 0 : n_image_tokens_);
+    if ((int)img_pos.size() != (text_only ? 0 : n_image_tokens_)) {
         fprintf(stderr, "[locateanything] image token count mismatch\n");
         return std::string();
     }
@@ -1167,14 +1175,16 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     // 4) embed + 把视觉特征 scatter 进 <IMG_CONTEXT> 所在行
     ncnn::Mat embed = run_text_embed(ids);               // Mat(hidden, S)
     const float* fp = image_features;                     // Mat(hidden, n_image_tokens_)
-    if (image_features.w != hidden_) {
+    if (!text_only && image_features.w != hidden_) {
         fprintf(stderr, "[locateanything] image feature width unexpected %d\n", image_features.w);
         return std::string();
     }
-    for (int j = 0; j < n_image_tokens_; j++) {
-        float* dst = embed.row(img_pos[j]);
-        const float* src = fp + (size_t)j * hidden_;
-        std::memcpy(dst, src, (size_t)hidden_ * sizeof(float));
+    if (!text_only) {
+        for (int j = 0; j < n_image_tokens_; j++) {
+            float* dst = embed.row(img_pos[j]);
+            const float* src = fp + (size_t)j * hidden_;
+            std::memcpy(dst, src, (size_t)hidden_ * sizeof(float));
+        }
     }
 
     // 5) 生成 cos/sin/掩码，prefill 整个序列
@@ -1229,10 +1239,12 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
             dump(std::string(pref) + "_hidden.f32", (const float*)last.data, (size_t)hidden_);
             dump(std::string(pref) + "_logits.f32", lp, (size_t)V);
         }
-        // 视觉特征指纹（与 DEBUG feat 行的 min/max/mean 一起用于跨平台比对）
-        double s = 0.0;
-        for (int i = 0; i < image_features.w * image_features.h; i++) s += fp[i];
-        fprintf(stderr, "[locateanything] FEATSUM %.6f\n", s);
+        // 视觉特征指纹（text-only 模式没有视觉特征）
+        if (!text_only) {
+            double s = 0.0;
+            for (int i = 0; i < image_features.w * image_features.h; i++) s += fp[i];
+            fprintf(stderr, "[locateanything] FEATSUM %.6f\n", s);
+        }
     }
 
     // 6) MTP 并行窗口解码（+ AR 回退），对齐 torch generation_mode='hybrid'。
