@@ -1,5 +1,5 @@
-﻿cmake_minimum_required(VERSION 3.18)
-project(locate-anything-ncnn LANGUAGES CXX)
+cmake_minimum_required(VERSION 3.18)
+project(locate-anything-ncnn LANGUAGES C CXX)
 
 # ============================================================================
 # LocateAnything-3B standalone runtime on ncnn.
@@ -24,6 +24,46 @@ set(_NCNN_DIR "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/ncnn")
 if(NOT EXISTS "${_NCNN_DIR}/CMakeLists.txt")
     message(FATAL_ERROR "ncnn submodule missing. Run: git submodule update --init --recursive")
 endif()
+
+# ---- apply vendored patches to the ncnn submodule (idempotent) ----
+# Each *.patch in patches/ is applied once at configure time, before ncnn is
+# built. Whether it is already applied is detected by a reverse apply check.
+find_package(Git REQUIRED)
+set(_NCNN_PATCHES_DIR "${CMAKE_CURRENT_SOURCE_DIR}/patches")
+file(GLOB _NCNN_PATCHES "${_NCNN_PATCHES_DIR}/*.patch")
+# file(GLOB) does not guarantee ordering; apply in the documented
+# numerical-prefix order so later patches can build on earlier ones.
+list(SORT _NCNN_PATCHES)
+foreach(_p ${_NCNN_PATCHES})
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C "${_NCNN_DIR}" apply --reverse --check "${_p}"
+        RESULT_VARIABLE _rev_result
+        OUTPUT_QUIET ERROR_QUIET)
+    if(_rev_result EQUAL 0)
+        message(STATUS "ncnn patch already applied: ${_p}")
+        continue()
+    endif()
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C "${_NCNN_DIR}" apply --check "${_p}"
+        RESULT_VARIABLE _chk_result
+        OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _chk_result EQUAL 0)
+        message(FATAL_ERROR
+            "ncnn patch does not apply cleanly (${_p}). "
+            "The submodule source does not match the patch base. "
+            "Run: git -C ${_NCNN_DIR} submodule update --init --recursive, or adjust patches/${_p}.")
+    endif()
+    execute_process(
+        COMMAND ${GIT_EXECUTABLE} -C "${_NCNN_DIR}" apply "${_p}"
+        RESULT_VARIABLE _apply_result
+        OUTPUT_QUIET ERROR_QUIET)
+    if(NOT _apply_result EQUAL 0)
+        message(FATAL_ERROR "failed to apply ncnn patch: ${_p}")
+    endif()
+    message(STATUS "applied ncnn patch: ${_p} (basename: ${_p})")
+endforeach()
+unset(_NCNN_PATCHES_DIR)
+
 set(NCNN_BUILD_TOOLS     OFF CACHE BOOL "" FORCE)
 set(NCNN_BUILD_EXAMPLES  OFF CACHE BOOL "" FORCE)
 set(NCNN_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
@@ -63,10 +103,12 @@ if(WIN32 OR MINGW)
         target_link_libraries(locate_anything PUBLIC ws2_32)
     endif()
 endif()
-if(UNIX AND NOT APPLE)
-    find_package(Threads REQUIRED)
-    target_link_libraries(locate_anything PUBLIC Threads::Threads)
-endif()
+
+# Threads detection is genuinely cross-platform: macOS and Linux need pthread,
+# MSVC links the correct CRT internally but Threads::Threads resolves to the
+# right library everywhere, so no platform guard should exclude any platform.
+find_package(Threads REQUIRED)
+target_link_libraries(locate_anything PUBLIC Threads::Threads)
 
 # ---- CLI entry ----
 add_executable(locate_main src/locate_main.cpp)
