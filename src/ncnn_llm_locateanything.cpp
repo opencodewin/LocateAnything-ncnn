@@ -374,6 +374,47 @@ static void la_shape(const char* tag, const ncnn::Mat& m) {
                 tag, m.dims, m.w, m.h, m.c, m.elempack, m.elemsize);
 }
 
+// 一行统计：w/h/min/max/nan 个数。NaN 会让 greedy argmax 恒返回下标 0（比较全 false），
+// 表现为 commit 全 0、一个框都解不出来，所以这里显式把 NaN 数出来。
+static void la_stat_line(const char* tag, const ncnn::Mat& m) {
+    if (m.empty()) {
+        fprintf(stderr, "[locateanything] STAT %s EMPTY (w=%d h=%d c=%d pack=%d)\n", tag, m.w, m.h,
+                m.c, m.elempack);
+        return;
+    }
+    const size_t n = (size_t)m.w * m.h * ((m.dims == 3) ? (size_t)m.c : 1u) * m.elempack;
+    const float* p = (const float*)m.data;
+    float mn = 1e30f, mx = -1e30f;
+    size_t nan_cnt = 0;
+    for (size_t i = 0; i < n; i++) {
+        float v = p[i];
+        if (std::isnan(v)) { nan_cnt++; continue; }
+        if (v < mn) mn = v;
+        if (v > mx) mx = v;
+    }
+    fprintf(stderr, "[locateanything] STAT %s w=%d h=%d c=%d pack=%d n=%zu min=%.4f max=%.4f nan=%zu\n",
+            tag, m.w, m.h, m.c, m.elempack, n, mn, mx, nan_cnt);
+}
+
+// 单行 logits 的指纹：V / 最大值 / argmax / NaN 数（V=0 时 argmax 必然为 0）
+static void la_logits_line(const char* tag, const ncnn::Mat& row) {
+    if (row.empty()) {
+        fprintf(stderr, "[locateanything] LOGITS %s EMPTY (w=%d h=%d)\n", tag, row.w, row.h);
+        return;
+    }
+    const int V = row.w;
+    const float* p = (const float*)row.data;
+    float mx = -1e30f;
+    int arg = 0;
+    size_t nan_cnt = 0;
+    for (int i = 0; i < V; i++) {
+        if (std::isnan(p[i])) { nan_cnt++; continue; }
+        if (p[i] > mx) { mx = p[i]; arg = i; }
+    }
+    fprintf(stderr, "[locateanything] LOGITS %s V=%d max=%.4f argmax=%d nan=%zu\n", tag, V, mx, arg,
+            nan_cnt);
+}
+
 // elempack -> 1（已是 1 时零成本返回原 Mat）
 static ncnn::Mat la_unpack(const ncnn::Mat& src, const char* tag) {
     if (src.elempack == 1) return src;
@@ -844,9 +885,12 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         // 窗口 logits = 最后 block_size_ 行
         int w0 = K - block_size_;
         std::vector<ncnn::Mat> win;
+        la_stat_line("decoder.window_hidden", hidden);
         for (int i = w0; i < K; i++) {
             win.push_back(run_lm_head(row_of(hidden, i, hidden_)));   // w=vocab
         }
+        la_logits_line("win0", win[0]);
+        la_logits_line("winLast", win[K - w0 - 1]);
         std::string type;
         std::vector<int> commit = mtp_window_decode(win, type, cfg);
 
@@ -898,7 +942,9 @@ void ncnn_llm_locateanything::decode_loop_ar(std::string& out_text, std::vector<
         if (cur == eos_id_ || cur == im_end_id_) break;
         ncnn::Mat hid = decode_single_causal(cur, pos);
         pos++;
+        la_stat_line("ar.hidden", hid);
         ncnn::Mat lo = run_lm_head(hid);
+        la_logits_line("ar.logits", lo);
         ncnn::Mat l2 = lo.clone();
         if (cfg.repetition_penalty != 1.0f) {
             float* pp = l2;
@@ -1132,6 +1178,8 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     KVCache kv;
     kv.reserve((size_t)layers_ * 2);
     ncnn::Mat hidden = run_decoder(embed, cos, sin, mask, kv, true);  // Mat(hidden, S)
+    la_stat_line("prefill.embed", embed);
+    la_stat_line("prefill.hidden", hidden);
     if (selftest_) self_check_decoder_prefill(hidden, embed, cos, sin, mask);
 
     // last-token hidden -> lm_head（供 selftest 校验；MTP 窗口第 0 行输出即首个生成 token，
