@@ -6,13 +6,19 @@
 - 支持动态输入推理（接近原始项目），拆分为 6 个子图：vision_embed / vision_encoder / vision_projector / text_embed / text_decoder(KV) / lm_head。
 - 支持 MTP 并行窗口解码 + 结构化坐标 token (`<box><x1><y1><x2><y2></box>`)。
 - 图像处理严格按照原始项目中的 `MAX_DIM=1024`，如果最大边超过 1024，采用 LANCZOS 预缩后再自适应 grid。
-- CPU fp32/fp16 正确路径；Vulkan 实验路径（测试机器为 1080ti，它不支持 fp16 计算且显存只有 11G，目前已知的是 fp16 的结果不正确，fp32 显存不够）
+- CPU fp32/fp16 正确路径（**已验证：macOS Apple Silicon、Windows Intel x86**；AMD CPU 上无输出，见「已知问题」）；Vulkan 实验路径（测试机器为 1080ti，它不支持 fp16 计算且显存只有 11G，目前已知的是 fp16 的结果不正确，fp32 显存不够）
 
 ## 已知问题
 - ~~ncnn 的 ROPE/RotaryEmbed Vulkan 实现存在问题~~ · 已修复：上游 [PR #6834](https://github.com/Tencent/ncnn/pull/6834) 支持全宽 `cos/sin` 缓存（2D / vision RoPE），已以 patch 方式在构建时自动应用，见 [patches](#构建--在-windows-msys2mingw-下构建未测试其他平台后续补齐)。
+  - 注意：该补丁只覆盖 `arm / loongarch / mips / generic(rotaryembed.cpp) / vulkan`，**未覆盖 `src/layer/x86/*`**。对本工程的输入而言 CPU 侧是 no-op（视觉 RoPE 走半宽缓存、文本 RoPE 两半同值），真正被修的是 Vulkan 的缓存步长；但 x86 CPU 上若出现"全宽且两半不同值"的 2D RoPE 仍会算错，后续需要补 x86 补丁。
 - Vulkan (GPU) 端到端输出错误。
   - **macOS（Apple M1 Pro, MoltenVK）实测：fp16 与 fp32 均完全发散**。`bench_platform` 定量结果显示两者输出坐标 token 全 0（最终为 `<ref>!!!…`），相对 CPU fp32 的文本一致性仅约 4.6%（详见下方「平台测试」）。虽然耗时快约 4.7×，但结果不可用。
+  - **RTX 5090（Vulkan）实测：fp16 与 fp32 均无有效输出**（不产出任何可用 `<box>` 坐标）。
   - 测试机 1080ti 另有：fp16 计算不支持、fp32 显存(11G)不足的限制（见「特性」）。
+- **AMD CPU（Linux）实测：无任何输出**（一个框都解不出来；同样的 x86 代码路径在 Windows Intel CPU 上正常）。
+  - 已排除的方向：`patches/` 的 RoPE 补丁对本工程输入在 CPU 上是 no-op（见上），不是根因；差异更可能来自编译器 / 运行时 ISA 分派（GCC vs MSVC、是否启用 AVX512）或 ncnn 在该架构返回 packed Mat（`elempack=4/8`）。
+  - 排查手段：运行时会打印各子图输出的 `SHAPE ... pack=N`（非 1 时会额外打印 `NOTE ... unpack packN -> pack1`）、视觉特征统计 `DEBUG feat`、以及跨平台指纹 `FEATSUM` / `PREFILL top5 logits`；`LA_DUMP_VISION=<path>` / `LA_DUMP_TEXT=<prefix>` 可 dump fp32 特征逐元素对比。宿主侧已对所有子图输出做"解包 + 摊平成规范 2D"处理（`la_canonical_2d` / `la_canonical_kv`），可排除 packed Mat 解释错位这一类问题。
+  - 若怀疑 AVX512 kernel：用 `-DNCNN_AVX512=OFF` 重编做二分别。
 
 ## 目录结构
 ```
@@ -57,6 +63,36 @@ Detected 2 box(es) on 1280x720 image:
   #0 norm=(0.1200,0.0800)-(0.6000,0.9000) px=(154,58)-(768,648) size=615x591
 ```
 归一化坐标 × 原图宽/高即像素坐标（`src/utils/draw_utils.h`：`parse_locate_boxes_text` / `draw_locate_boxes`）。
+
+## 跨平台一致性排查（某平台无输出 / 结果发散时）
+运行时会打印可直接跨平台比对的"指纹"，用来定位发散发生在哪一级：
+
+| 输出 | 含义 |
+| --- | --- |
+| `SHAPE <子图.输出> dims=.. w=.. h=.. c=.. pack=..` | 子图输出的 Mat 布局。**`pack` 必须 = 1**；非 1 时会额外打印 `NOTE ... unpack packN -> pack1`，宿主已自动解包（x86 AVX512 等架构上 ncnn 可能返回 pack4/pack8，未解包会导致坐标全错） |
+| `DEBUG feat w=.. h=.. min=.. max=.. mean=..` | 视觉特征（vision_projector 输出）统计 |
+| `FEATSUM` | 视觉特征求和，跨平台应逐位一致 |
+| `PREFILL top5 logits(V=..): id:logit ...` | prompt 末位 top-5 logits，跨平台应逐位一致 |
+
+更深入的逐元素对比（md5 或 numpy 比对）：
+```bash
+LA_DUMP_VISION=/tmp/feat.f32 LA_DUMP_TEXT=/tmp/pre \
+  ./locate_main --model <模型目录> --image ../datas/football.jpg --prompt human --max-new-tokens 20 --threads 8
+md5sum /tmp/feat.f32 /tmp/pre_hidden.f32 /tmp/pre_logits.f32
+```
+- `LA_DUMP_VISION=<path>`：投影后的视觉特征 `[n_tokens, hidden]` fp32。
+- `LA_DUMP_TEXT=<prefix>`：prefill 末位 hidden（`<prefix>_hidden.f32`）与 logits（`<prefix>_logits.f32`）。
+
+**基准（macOS M1 Pro，CPU fp32，`models/locate-anything-fp16` + `datas/football.jpg` + `--prompt human --max-new-tokens 20`）**：
+```
+DEBUG feat w=2048 h=925 min=-29.245 max=14.516 mean=-0.0010
+FEATSUM -1853.253568
+PREFILL top5 logits(V=152681): 151672:23.3104 151645:8.5655 151668:8.5340 151741:7.0714 152191:6.9475
+md5 feat.f32        = 98fa1daf78da0786cbd7d1e05e504f87
+md5 pre_hidden.f32  = 7fd2130dd0dae61da7b94ecb6e0b65c6
+md5 pre_logits.f32  = 7f7446504468f4712cfeb3b0384de00a
+```
+`FEATSUM` 不一致 → 视觉链（vision_embed/encoder/projector 或宿主 pos_emb 插值/moon RoPE）发散；`FEATSUM` 一致但 `PREFILL top5` 不一致 → 文本链（text_embed / decoder prefill / lm_head）发散。
 
 ## 平台测试
 `bench_platform` 在同一输入下按 **cpu-fp32 → gpu-fp32 → gpu-fp16** 顺序运行，统计各平台端到端耗时（`end-to-end avg`），并以 **cpu-fp32 输出为参考**衡量其它平台文本一致性（归一化 Levenshtein，1 = 与参考完全一致）。使用 greedy 确定性解码，保证跨平台可比；每平台先 warmup 1 次（不计时）再测 N 次。

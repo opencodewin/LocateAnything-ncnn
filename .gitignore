@@ -10,3 +10,5 @@ compile_commands.json
 *.o
 # model dirs are kept external (referenced via --model)
 /models/
+# CLI 标注输出（--save 默认 <image>_locate.png）
+*_locate.png

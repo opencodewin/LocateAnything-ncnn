@@ -356,6 +356,73 @@ ncnn::Mat ncnn_llm_locateanything::causal_mask(int seq) {
 // 子图驱动
 // ============================================================================
 
+// 子图输出的"规范化"。
+//
+// 背景：宿主代码按"规范 fp32 2D Mat（w=dim，h=rows，逐行连续）"解释每个子图的输出
+// （row_of / hidden.row(i) 直接 memcpy hidden_*4 字节）。但 ncnn 各后端的 packing
+// 支持是**按架构实现**的（arm neon / x86 sse-avx / avx512 各不相同），同一个导出图
+// 在不同 CPU 上可能返回 elempack=4 或 8 的 Mat —— 此时 w 变成 dim/pack，memcpy 会
+// 静默少拷，解码出的坐标就是垃圾（表现为"一个框都画不出来"）。视觉链之前就踩过同一
+// 个坑（见 run_vision_features 里对 encoder 输出的重新装箱）。
+//
+// 因此所有子图输出统一先解包到 elempack=1，再摊平成规范 2D（w=dim，h=rows）。
+static void la_shape(const char* tag, const ncnn::Mat& m) {
+    static std::unordered_set<std::string> seen;
+    std::string key = tag;
+    if (seen.insert(key).second)
+        fprintf(stderr, "[locateanything] SHAPE %s dims=%d w=%d h=%d c=%d pack=%d es=%zu\n",
+                tag, m.dims, m.w, m.h, m.c, m.elempack, m.elemsize);
+}
+
+// elempack -> 1（已是 1 时零成本返回原 Mat）
+static ncnn::Mat la_unpack(const ncnn::Mat& src, const char* tag) {
+    if (src.elempack == 1) return src;
+    ncnn::Mat dst;
+    ncnn::Option opt;
+    opt.blob_allocator = nullptr;
+    opt.workspace_allocator = nullptr;
+    ncnn::convert_packing(src, dst, 1, opt);
+    if (dst.empty()) {
+        fprintf(stderr, "[locateanything] WARN %s: unpack pack%d failed\n", tag, src.elempack);
+        return src;
+    }
+    fprintf(stderr, "[locateanything] NOTE %s: unpack pack%d -> pack1 (w=%d h=%d c=%d)\n",
+            tag, src.elempack, dst.w, dst.h, dst.c);
+    return dst;
+}
+
+// 摊平成规范 2D Mat（w=expect_w，h=行数）。dims=3 且 c>1 时按"c 主序、y 次序"摊平。
+static ncnn::Mat la_canonical_2d(const ncnn::Mat& src, int expect_w, const char* tag) {
+    la_shape(tag, src);
+    ncnn::Mat m = la_unpack(src, tag);
+    if (m.dims == 2 && m.w == expect_w) return m;
+    if (m.dims == 1 && m.w == expect_w) {
+        ncnn::Mat out(expect_w, 1);
+        memcpy(out.data, m.data, (size_t)expect_w * sizeof(float));
+        return out;
+    }
+    if (m.dims == 3 && m.w == expect_w) {
+        ncnn::Mat out(m.w, m.h * m.c);
+        for (int c = 0; c < m.c; c++)
+            for (int y = 0; y < m.h; y++)
+                memcpy(out.row(c * m.h + y), m.channel(c).row(y), (size_t)m.w * sizeof(float));
+        return out;
+    }
+    if (m.w != expect_w)
+        fprintf(stderr, "[locateanything] WARN %s: w=%d != expect %d (dims=%d h=%d c=%d)\n",
+                tag, m.w, expect_w, m.dims, m.h, m.c);
+    return m;
+}
+
+// KV cache：保持 dims=3（w=head_dim, h=rows, c=kv_heads），只解包
+static ncnn::Mat la_canonical_kv(const ncnn::Mat& src, const char* tag) {
+    la_shape(tag, src);
+    ncnn::Mat m = la_unpack(src, tag);
+    if (m.dims != 3)
+        fprintf(stderr, "[locateanything] WARN %s: unexpected dims=%d (expect 3)\n", tag, m.dims);
+    return m;
+}
+
 ncnn::Mat ncnn_llm_locateanything::run_text_embed(const std::vector<int>& ids) {
     ncnn::Mat in((int)ids.size(), 1, (void*)ids.data());
     in = in.clone();
@@ -363,7 +430,7 @@ ncnn::Mat ncnn_llm_locateanything::run_text_embed(const std::vector<int>& ids) {
     ncnn::Extractor ex = net_text_embed_->create_extractor();
     ex.input("in0", in);
     ex.extract("out0", out);
-    return out;
+    return la_canonical_2d(out, hidden_, "text_embed.out0");
 }
 
 ncnn::Mat ncnn_llm_locateanything::run_decoder(const ncnn::Mat& emb, const ncnn::Mat& cos,
@@ -396,6 +463,8 @@ ncnn::Mat ncnn_llm_locateanything::run_decoder(const ncnn::Mat& emb, const ncnn:
         ncnn::Mat ok_, ov_;
         ex.extract(("out_cache_k" + std::to_string(i)).c_str(), ok_);
         ex.extract(("out_cache_v" + std::to_string(i)).c_str(), ov_);
+        ok_ = la_canonical_kv(ok_, "decoder.out_cache_k");
+        ov_ = la_canonical_kv(ov_, "decoder.out_cache_v");
         if (is_prefill) {
             kv.emplace_back(ok_, ov_);
         } else {
@@ -404,7 +473,7 @@ ncnn::Mat ncnn_llm_locateanything::run_decoder(const ncnn::Mat& emb, const ncnn:
         }
     }
     ex.extract("out0", out);
-    return out;
+    return la_canonical_2d(out, hidden_, "text_decoder.out0");
 }
 
 ncnn::Mat ncnn_llm_locateanything::run_lm_head(const ncnn::Mat& hidden) {
@@ -412,7 +481,8 @@ ncnn::Mat ncnn_llm_locateanything::run_lm_head(const ncnn::Mat& hidden) {
     ncnn::Extractor ex = net_lm_head_->create_extractor();
     ex.input("in0", hidden);
     ex.extract("out0", out);
-    return out;
+    la_shape("lm_head.out0", out);
+    return la_unpack(out, "lm_head.out0");
 }
 
 // ============================================================================
@@ -893,6 +963,7 @@ ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
     ncnn::Mat v0;
     { ncnn::Extractor ex = net_vision_embed_->create_extractor();
       ex.input("in0", img); ex.input("in1", pos); ex.extract("out0", v0); }
+    v0 = la_canonical_2d(v0, vision_hidden_, "vision_embed.out0");
     // vision_encoder: in0=[1,L,dim] in1/2=moon cos/sin（动态 gh/gw），输出未 merge body
     ncnn::Mat vcos, vsin;
     moon_rope_cos(grid_h_, grid_w_, vcos, vsin);
@@ -901,8 +972,9 @@ ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
       ex.input("in0", v0); ex.input("in1", vcos); ex.input("in2", vsin); ex.extract("out0", v1); }
     // 关键：encoder 输出 Mat 若跨子图直喂，会被误读 shape（pack/拓扑元数据）。
     // 重新装箱成规范 fp32 2D Mat 再喂 patch_merge/投影（实测 raw 给 h=1，rebox 给 h=256）。
-    ncnn::Mat v1b(v1.w, v1.h);
-    memcpy(v1b.data, v1.data, (size_t)v1.w * v1.h * sizeof(float));
+    // 现在统一走 la_canonical_2d：先把可能的 pack4/pack8 解包（不同 CPU 架构的 ncnn
+    // packing 支持不同，AVX512 等平台会返回 pack8），再摊平成 [dim, L]。
+    ncnn::Mat v1b = la_canonical_2d(v1, vision_hidden_, "vision_encoder.out0");
     // 宿主 2x2 patch_merge（不再留在 encoder 图里）
     ncnn::Mat v1m;
     patch_merge_2x2(v1b, grid_h_, grid_w_, v1m);   // [M, merge_out=4*dim]
@@ -910,6 +982,7 @@ ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
     ncnn::Mat vfeat;
     { ncnn::Extractor ex = net_vision_projector_->create_extractor();
       ex.input("in0", v1m); ex.extract("out0", vfeat); }
+    vfeat = la_canonical_2d(vfeat, hidden_, "vision_projector.out0");
     n_image_tokens_ = (grid_h_ / merge_) * (grid_w_ / merge_);
     // LA_DUMP_VISION=<path>：把投影后的 [n_tokens, hidden] fp32 特征 dump 成 .f32，
     // 供与 torch extract_feature+mlp1 逐元素对比（验证动态导出数值正确性）。
@@ -1066,6 +1139,46 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     ncnn::Mat last(2048, 1);
     std::memcpy((float*)last.data, hidden.row(S - 1), (size_t)hidden_ * sizeof(float));
     if (selftest_) self_check_lm_head(last);
+
+    // 跨平台指纹：prompt 末位的 top-5 logits。同模型同输入下各平台必须逐位一致，
+    // 出现分歧即说明子图/链路在某平台发散（用于排查"某 CPU 上不出框"）。
+    {
+        ncnn::Mat lg = run_lm_head(last);
+        const int V = lg.w;
+        std::vector<std::pair<float, int>> top;
+        const float* lp = lg;
+        for (int i = 0; i < V; i++) {
+            if ((int)top.size() < 5) {
+                top.emplace_back(lp[i], i);
+                std::push_heap(top.begin(), top.end(), std::greater<>());
+            } else if (lp[i] > top.front().first) {
+                std::pop_heap(top.begin(), top.end(), std::greater<>());
+                top.back() = std::make_pair(lp[i], i);
+                std::push_heap(top.begin(), top.end(), std::greater<>());
+            }
+        }
+        std::sort(top.begin(), top.end(), std::greater<>());
+        fprintf(stderr, "[locateanything] PREFILL top5 logits(V=%d):", V);
+        for (auto& kv : top) fprintf(stderr, " %d:%.4f", kv.second, kv.first);
+        fprintf(stderr, "\n");
+        // LA_DUMP_TEXT=<prefix>：dump prefill 末位 hidden 与 logits（fp32），
+        // 供跨平台 md5 / 逐元素对比，定位"某平台无输出"的发散点。
+        if (const char* pref = std::getenv("LA_DUMP_TEXT")) {
+            auto dump = [](const std::string& p, const float* d, size_t n) {
+                FILE* f = fopen(p.c_str(), "wb");
+                if (!f) { fprintf(stderr, "[locateanything] dump failed: %s\n", p.c_str()); return; }
+                fwrite(d, sizeof(float), n, f);
+                fclose(f);
+                fprintf(stderr, "[locateanything] dumped %s (%zu floats)\n", p.c_str(), n);
+            };
+            dump(std::string(pref) + "_hidden.f32", (const float*)last.data, (size_t)hidden_);
+            dump(std::string(pref) + "_logits.f32", lp, (size_t)V);
+        }
+        // 视觉特征指纹（与 DEBUG feat 行的 min/max/mean 一起用于跨平台比对）
+        double s = 0.0;
+        for (int i = 0; i < image_features.w * image_features.h; i++) s += fp[i];
+        fprintf(stderr, "[locateanything] FEATSUM %.6f\n", s);
+    }
 
     // 6) MTP 并行窗口解码（+ AR 回退），对齐 torch generation_mode='hybrid'。
     //    ids 即 prompt token 流，函数内会追加生成 token；out_text 由回调逐 token 累积。
