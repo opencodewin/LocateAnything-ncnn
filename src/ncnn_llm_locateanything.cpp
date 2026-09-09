@@ -859,6 +859,9 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         // ---- MTP 窗口 ----
         int L = (int)stream.size();
         int past = (int)kv[0].first.h;
+        fprintf(stderr, "[locateanything] WINSTATE L=%d past=%d cache_len=%d blk=%d kvh(w=%d h=%d c=%d pack=%d)\n",
+                L, past, cache_len, block_size_, kv[0].first.w, kv[0].first.h, kv[0].first.c,
+                kv[0].first.elempack);
         // 块 = [未缓存真实 token][rep=stream[-1]][mask_tok × (block-1)]
         std::vector<int> blk;
         for (int i = cache_len; i < L; i++) blk.push_back(stream[i]);
@@ -877,6 +880,7 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         for (int j = 1; j < block_size_; j++) bpos[m++] = L + j;
 
         ncnn::Mat blk_emb = run_text_embed(blk);          // [hidden,K]
+        la_stat_line("blk_emb", blk_emb);
         ncnn::Mat cos, sin;
         text_rope_cos_sin_at(bpos, cos, sin);
         ncnn::Mat mask = mtp_mask(K, past);
@@ -902,6 +906,9 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         emit(commit);
         if (type == "im_end") break;
         trim_kv(kv, L);                                   // 丢弃窗口，KV 只留真实 [0:L)
+        fprintf(stderr, "[locateanything] KVSTAT after-trim rows=%d (w=%d h=%d c=%d pack=%d) expect=%d\n",
+                (int)kv[0].first.h, kv[0].first.w, kv[0].first.h, kv[0].first.c,
+                kv[0].first.elempack, L);
         cache_len = L;                                    // 真实 token 缓存到 L（提交前）
         if (type == "error_box") in_mtp = false;          // 出错 -> AR
         // coord_box / point_box / empty_box / ref_object 继续 MTP
