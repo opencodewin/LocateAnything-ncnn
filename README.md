@@ -29,7 +29,7 @@ models/         # （外部）fp32 / fp16 动态模型目录，通过 --model �
 ## 模型
 模型提供 fp16 和 fp32 两种动态导出，模型已在上传中。
 - fp32 动态：`locate-anything-fp32`
-- fp16 动态：`locate-anything-fp16`
+- fp16 动态：[`locate-anything-fp16`](https://www.modelscope.cn/models/sizeofbeer/locate-anything-fp16)
 
 ## 构建 (目前在 Windows MSYS2/MinGW 下构建，未测试其他平台，后续补齐)
 ```bash
