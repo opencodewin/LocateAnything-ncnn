@@ -59,8 +59,9 @@ static ncnn::Mat bgr_to_rgb_chw_normalized(const ncnn::Mat& bgr, int target_w, i
 // ============================================================================
 ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
                                                  bool use_vulkan, int num_threads,
-                                                 int vulkan_device)
-    : ncnn_llm_base(use_vulkan, num_threads > 0 ? num_threads : 4) {
+                                                 int vulkan_device, bool use_fp16)
+    : ncnn_llm_base(use_vulkan, num_threads > 0 ? num_threads : 4,
+                    vulkan_device, use_fp16) {
     try {
         json config;
         {
@@ -79,9 +80,12 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
             auto net = std::make_shared<ncnn::Net>();
             net->opt = create_option();
             net->opt.use_vulkan_compute = vk;
-            // 精度策略：默认纯 CPU 走 fp32，与 torch 参考一致，输出正确稳定。
-            // fp16 仅留给显存受限的 Vulkan 实验路径(--vulkan)，但 1080Ti 上 fp16 计算发散，
-            // 该路径仅供实验，不为正确性保证。
+            // 视觉链与 CPU 副本固定 fp32，与 torch 参考一致；fp16 只开给 Vulkan 文本链路。
+            if (!vk) {
+                net->opt.use_fp16_packed = false;
+                net->opt.use_fp16_storage = false;
+                net->opt.use_fp16_arithmetic = false;
+            }
             std::string p = model_path + "/" + config["params"][key]["param"].get<std::string>();
             std::string b = model_path + "/" + config["params"][key]["bin"].get<std::string>();
             if (net->load_param(p.c_str()) != 0 || net->load_model(b.c_str()) != 0) {
@@ -788,6 +792,60 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
     fprintf(stderr, "[locateanything] LOOP-END stream=%zu limit=%d last=%d\n", stream.size(), limit, stream.empty() ? -1 : stream.back());
 }
 
+// 纯逐 token AR 生成循环：每步在增量位置因果前向、采样 1 个新 token 追加进 KV，
+// 直到遇到 eos/im_end 或达 max_new_tokens。与 decode_loop_mtp 的"AR 回退"供应商相同，
+// 但全程不用 MTP 窗口，用于对比 MTP 与纯 AR 的输出差异。
+void ncnn_llm_locateanything::decode_loop_ar(std::string& out_text, std::vector<int>& stream,
+                                             KVCache& kv, const LocateGenerateConfig& cfg,
+                                             std::unordered_set<int>& history) {
+    int limit = (int)stream.size() + cfg.max_new_tokens;
+
+    auto emit = [&](const std::vector<int>& toks) {
+        for (int t : toks) {
+            std::string d = bpe_->decode({t}, true);
+            if (cfg.callback) cfg.callback(d);
+            out_text += d;
+        }
+    };
+    // 单 token 因果前向：位置 pos 的真实 token -> 返回该位置 hidden（KV 追加一行）。
+    auto decode_single_causal = [&](int tok, int pos) -> ncnn::Mat {
+        ncnn::Mat emb = run_text_embed({tok});          // [hidden,1]
+        ncnn::Mat c, s;
+        text_rope_cos_sin(1, pos, c, s);
+        int past = (int)kv[0].first.h;
+        ncnn::Mat m(past + 1, 1);
+        m.fill(0.f);
+        return run_decoder(emb, c, s, m, kv, false);
+    };
+
+    int pos = (int)stream.size();   // 下一个要解码的真实位置（全文皆已预填充，KV 长度==stream 大小）
+    while ((int)stream.size() < limit) {
+        int cur = stream.back();
+        if (cur == eos_id_ || cur == im_end_id_) break;
+        ncnn::Mat hid = decode_single_causal(cur, pos);
+        pos++;
+        ncnn::Mat lo = run_lm_head(hid);
+        ncnn::Mat l2 = lo.clone();
+        if (cfg.repetition_penalty != 1.0f) {
+            float* pp = l2;
+            for (int id : history) {
+                if (id < l2.w) {
+                    float v = pp[id];
+                    pp[id] = v > 0.f ? v / cfg.repetition_penalty : v * cfg.repetition_penalty;
+                }
+            }
+        }
+        int next = sample_logits_row(l2, l2.w, cfg);
+        stream.push_back(next);
+        emit({next});
+        history.insert(next);
+        fprintf(stderr, "[locateanything] AR tok=%d (pos=%d)\n", next, pos);
+        if (next == eos_id_ || next == im_end_id_) break;
+    }
+    fprintf(stderr, "[locateanything] AR-LOOP-END stream=%zu limit=%d last=%d\n",
+            stream.size(), limit, stream.empty() ? -1 : stream.back());
+}
+
 // 视觉链：返回 [1, n_image_tokens, hidden] 图像特征（image_features 承载该 Mat）
 ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
                                                        ncnn::Mat& image_features) {
@@ -954,7 +1012,10 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     // 6) MTP 并行窗口解码（+ AR 回退），对齐 torch generation_mode='hybrid'。
     //    ids 即 prompt token 流，函数内会追加生成 token；out_text 由回调逐 token 累积。
     std::unordered_set<int> history;
-    decode_loop_mtp(out_text, ids, kv, cfg, history);
+    if (cfg.use_mtp)
+        decode_loop_mtp(out_text, ids, kv, cfg, history);
+    else
+        decode_loop_ar(out_text, ids, kv, cfg, history);
     return out_text;
 }
 

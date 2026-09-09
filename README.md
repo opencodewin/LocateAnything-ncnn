@@ -10,7 +10,9 @@
 
 ## 已知问题
 - ~~ncnn 的 ROPE/RotaryEmbed Vulkan 实现存在问题~~ · 已修复：上游 [PR #6834](https://github.com/Tencent/ncnn/pull/6834) 支持全宽 `cos/sin` 缓存（2D / vision RoPE），已以 patch 方式在构建时自动应用，见 [patches](#构建--在-windows-msys2mingw-下构建未测试其他平台后续补齐)。
-- Vulkan fp16 结果不正确、fp32 显存不足（测试机 1080ti 限制，详见特性）。
+- Vulkan (GPU) 端到端输出错误。
+  - **macOS（Apple M1 Pro, MoltenVK）实测：fp16 与 fp32 均完全发散**。`bench_platform` 定量结果显示两者输出坐标 token 全 0（最终为 `<ref>!!!…`），相对 CPU fp32 的文本一致性仅约 4.6%（详见下方「平台测试」）。虽然耗时快约 4.7×，但结果不可用。
+  - 测试机 1080ti 另有：fp16 计算不支持、fp32 显存(11G)不足的限制（见「特性」）。
 
 ## 目录结构
 ```
@@ -40,5 +42,38 @@ cmake --build build
 
 ## 运行
 ```bash
-./build/locate_main.exe --model <fp32|fp16 模型目录> --image <img> --prompt <query> [--vulkan] [--threads N]
+./build/locate_main.exe --model <fp32|fp16 模型目录> --image <img> --prompt <query> [选项]
 ```
+选项：
+- `--vulkan`：文本链路走 Vulkan GPU；`--vulkan-device <idx>`：多 GPU 时指定设备序号（启动时会列出所有可用设备及编号；越界自动回退 0）。
+- `--fp16` / `--fp32`：推理精度（默认 fp32）。`--fp16` 仅作用于 Vulkan 文本链路，视觉链与 CPU 路径恒为 fp32，避免污染视觉特征 / CPU 无 FP16 硬件的回退。
+- `--threads N`、`--greedy`、`--max-new-tokens N` 同前。
+
+## 平台测试
+`bench_platform` 在同一输入下按 **cpu-fp32 → gpu-fp32 → gpu-fp16** 顺序运行，统计各平台端到端耗时（`end-to-end avg`），并以 **cpu-fp32 输出为参考**衡量其它平台文本一致性（归一化 Levenshtein，1 = 与参考完全一致）。使用 greedy 确定性解码，保证跨平台可比；每平台先 warmup 1 次（不计时）再测 N 次。
+
+### 在某个平台上做测试的步骤
+1. **构建**（含 `bench_platform`）。目标机没有可用的 Vulkan 实现时可以关掉只做 CPU 对比：`-DLOCATE_NCNN_VULKAN=OFF`。
+   ```bash
+   cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+   cmake --build build --target bench_platform
+   ```
+2. **快速验证**（小 `--max-new-tokens`，确认平台能跑通、GPU 可枚举）：
+   ```bash
+   cd build
+   ./bench_platform --image ../datas/football.jpg --prompt human --max-new-tokens 20 --iter 1
+   ```
+   启用 Vulkan 时，`[ncnn] Vulkan devices (N)` 会列出所有可用设备及编号，越界会自动回退到 0。
+3. **正式统计**（默认 512 token；CPU 平台耗时较高，可按需调小）：
+   ```bash
+   ./bench_platform --image ../datas/football.jpg --prompt human --iter 3
+   ```
+   可选：`--threads N`、`--max-new-tokens N`、`--vulkan-device <idx>`、`--no-mtp`（纯逐 token AR 解码）、`--cpu-only`（只跑 CPU，跳过已知不可用的 Vulkan）。
+4. **解读结果**：
+   - **耗时**：各平台 `end-to-end avg`，对比不同计算后端/精度的吞吐。
+   - **一致性**：参考平台之外的 `sim(vs cpu-fp32)` 与 `identical`；接近 1 表示与 CPU fp32 输出一致，接近 0 表示发散（例如本仓库 macOS 上两个 Vulkan 配置都只有约 4.6%）。
+
+**注意**：
+- **参考基准 cpu-fp32 并不等于绝对真值**。`datas/football.jpg` 实际包含 **8 人**，但默认 `max_new` 较小时可能只输出少量 box —— 本工具的一致性只衡量「各平台输出是否彼此相同」，不代表「检出全部目标」。要评估检测质量（漏检/误检），应另用带标注数据做 recall / precision 评测。
+- **MTP 与 AR 都是对的，差异不在解码算法，而在 `--max-new-tokens` 要设置得足够大**。`bench_platform` 实测：对同一输入，MTP（`default`）与 AR（`--no-mtp`）生成的 token 序列几乎逐位一致（唯一分歧是某框 x2 坐标差 2 个 bin，来自 MTP 并行窗口的数值近似，可忽略）。同一 `max_new=20` 时 MTP 只够提交 3 个完整框（一个框恰为 6 token：`box+4 坐标+/box`），到 3 框即被截断，看起来「只检出 3 人」；换成 `--no-mtp --max-new-tokens 48 --cpu-only` 则 AR 能继续框出到第 7 框（第 8 框被 limit 截断）。也就是说「框数变少」是 token 预算截断的假象，不是 MTP 或 AR 导致；MTP 并行与 AR 逐 token 都应产出相同结果。
+- **跨平台/跨模式下对比时 `--max-new-tokens` 必须一致且给足**（或统一用自然 `im_end` 终止），否则框数/文本差异只是截断点的假象。图中 8 人一次性并非都会被框出，漏检仍主要是模型在该图的召回率问题，与 CPU/GPU、中英文、MTP/AR 无关。

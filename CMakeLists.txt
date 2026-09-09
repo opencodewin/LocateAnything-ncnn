@@ -115,3 +115,8 @@ add_executable(locate_main src/locate_main.cpp)
 target_link_libraries(locate_main PRIVATE locate_anything)
 set_target_properties(locate_main PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
 
+# ---- cross-platform bench: cpu-fp32 / gpu-fp32 / gpu-fp16 with CPU-fp32 reference ----
+add_executable(bench_platform src/bench_platform.cpp)
+target_link_libraries(bench_platform PRIVATE locate_anything)
+set_target_properties(bench_platform PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+

@@ -43,13 +43,14 @@ struct LocateGenerateConfig {
     int top_k = 50;
     float repetition_penalty = 1.1f;
     bool do_sample = true;
+    bool use_mtp = true;   // true: MTP 并行窗口解码（torch hybrid）；false: 纯逐 token AR
     std::function<void(const std::string&)> callback = nullptr;
 };
 
 class ncnn_llm_locateanything : public ncnn_llm_base {
 public:
     ncnn_llm_locateanything(const std::string& model_path, bool use_vulkan, int num_threads,
-                            int vulkan_device = 0);
+                            int vulkan_device = 0, bool use_fp16 = false);
 
     bool ok() const { return ok_; }
     const std::string& model_type() const { return model_type_; }
@@ -92,6 +93,10 @@ private:
     // 使 mask 占位不污染后续窗口的注意力键，等价于 torch 每步截断 KV 后重喂）。
     void decode_loop_mtp(std::string& out_text, std::vector<int>& stream, KVCache& kv,
                          const LocateGenerateConfig& cfg, std::unordered_set<int>& history);
+    // 纯逐 token AR 生成循环（不构造 MTP 窗口）：每步因果前向 1 个新位置 -> lm_head 采样，
+    // 遇见 eos/im_end 终止。供与 MTP 解码的输出对比（cfg.use_mtp=false 时启用）。
+    void decode_loop_ar(std::string& out_text, std::vector<int>& stream, KVCache& kv,
+                        const LocateGenerateConfig& cfg, std::unordered_set<int>& history);
     // 诊断：LA_SELFTEST=1 时，每个子图同时用 Vulkan + CPU 副本喂相同输入，打印 maxdiff。
     // 用于逐步定位 Vulkan 分歧点（视觉链/embed/prefill/lm_head）。
     void self_check_vision(const ncnn::Mat& img, const ncnn::Mat& pos);

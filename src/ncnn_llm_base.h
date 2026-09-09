@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <random>
@@ -10,6 +11,10 @@
 
 #include <mat.h>
 #include <net.h>
+
+#if NCNN_VULKAN
+#include <gpu.h>
+#endif
 
 using KVCache = std::vector<std::pair<ncnn::Mat, ncnn::Mat>>;
 
@@ -107,14 +112,30 @@ class ncnn_llm_base {
 protected:
     bool use_vulkan_ = false;
     int num_threads_ = 4;
+    int vulkan_device_ = 0;   // 使用的 Vulkan 设备序号（多 GPU 时可指定）
+    bool use_fp16_ = false;   // Vulkan 走 fp16（默认 fp32，供 fp16 测试）
     bool ok_ = true;
     std::mt19937 rng_{std::random_device{}()};
 
-    ncnn_llm_base(bool use_vulkan = false, int num_threads = 4)
-        : use_vulkan_(use_vulkan), num_threads_(num_threads) {
+    ncnn_llm_base(bool use_vulkan = false, int num_threads = 4,
+                  int vulkan_device = 0, bool use_fp16 = false)
+        : use_vulkan_(use_vulkan), num_threads_(num_threads),
+          vulkan_device_(vulkan_device), use_fp16_(use_fp16) {
 #if NCNN_VULKAN
-        if (use_vulkan_) {
+        if (use_vulkan) {
             ncnn::create_gpu_instance();
+            int cnt = ncnn::get_gpu_count();
+            fprintf(stderr, "[ncnn] Vulkan devices (%d):\n", cnt);
+            for (int i = 0; i < cnt; i++) {
+                const char* name = ncnn::get_gpu_info(i).device_name();
+                fprintf(stderr, "  [%d] %s%s\n", i, name ? name : "<unknown>",
+                        i == vulkan_device_ ? "  <-- selected" : "");
+            }
+            if (vulkan_device_ < 0 || vulkan_device_ >= cnt) {
+                fprintf(stderr, "[ncnn] vulkan device index %d out of range, fall back to 0\n",
+                        vulkan_device_);
+                vulkan_device_ = 0;
+            }
         }
 #endif
     }
@@ -132,6 +153,21 @@ protected:
         opt.num_threads = num_threads_;
         opt.use_bf16_storage = false;
         opt.use_vulkan_compute = use_vulkan_;
+        // fp16 仅作用于 Vulkan 计算链路（视觉链与 CPU 副本在 load_net 里强制回 fp32）。
+        if (use_fp16_) {
+            opt.use_fp16_packed = true;
+            opt.use_fp16_storage = true;
+            opt.use_fp16_arithmetic = true;
+        }
+#if NCNN_VULKAN
+        if (use_vulkan_) {
+            // 绑定到指定 Vulkan 设备（多 GPU 时由 --vulkan-device 决定）。
+            // VulkanDevice 仅暴露 blob/staging 两个 allocator，workspace 复用 blob。
+            ncnn::VulkanDevice* gpu = ncnn::get_gpu_device(vulkan_device_);
+            opt.blob_vkallocator = gpu->acquire_blob_allocator();
+            opt.staging_vkallocator = gpu->acquire_staging_allocator();
+        }
+#endif
         return opt;
     }
 

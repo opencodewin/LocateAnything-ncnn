@@ -25,6 +25,8 @@ int main(int argc, char** argv) {
     bool prompt_set = false;
     bool use_vulkan = false;
     bool greedy = false;
+    bool use_fp16 = false;
+    int vulkan_device = 0;
     int threads = 4;
     int max_new = 512;
 
@@ -34,6 +36,12 @@ int main(int argc, char** argv) {
         else if (arg == "--image" && i + 1 < args.size()) image_path = args[++i];
         else if (arg == "--prompt" && i + 1 < args.size()) { prompt = args[++i]; prompt_set = true; }
         else if (arg == "--vulkan") use_vulkan = true;
+        else if (arg == "--vulkan-device" && i + 1 < args.size()) {
+            vulkan_device = std::stoi(args[++i]);
+            if (vulkan_device < 0) vulkan_device = 0;
+        }
+        else if (arg == "--fp16") use_fp16 = true;
+        else if (arg == "--fp32") use_fp16 = false;
         else if (arg == "--greedy") greedy = true;
         else if (arg == "--max-new-tokens" && i + 1 < args.size()) {
             max_new = std::stoi(args[++i]);
@@ -46,15 +54,18 @@ int main(int argc, char** argv) {
     }
 
     if (image_path.empty()) {
-        fprintf(stderr, "Usage: %s --image <image_path> [--model <model_path>] [--prompt <question>] [--vulkan]\n",
+        fprintf(stderr, "Usage: %s --image <image_path> [--model <model_path>] [--prompt <question>]\n"
+                        "       [--vulkan] [--vulkan-device <idx>] [--fp16|--fp32] [--threads N]\n",
                 argv[0]);
         return 1;
     }
 
-    printf("Loading LocateAnything model from %s (threads=%d, vulkan=%s)\n",
-           model_path.c_str(), threads, use_vulkan ? "on" : "off");
+    printf("Loading LocateAnything model from %s (threads=%d, vulkan=%s%s, precision=%s)\n",
+           model_path.c_str(), threads, use_vulkan ? "on" : "off",
+           use_vulkan ? (" device=" + std::to_string(vulkan_device)).c_str() : "",
+           use_fp16 ? "fp16" : "fp32");
 
-    ncnn_llm_locateanything la(model_path, use_vulkan, threads);
+    ncnn_llm_locateanything la(model_path, use_vulkan, threads, vulkan_device, use_fp16);
     if (!la.ok()) {
         fprintf(stderr, "Failed to load LocateAnything model\n");
         return 1;
