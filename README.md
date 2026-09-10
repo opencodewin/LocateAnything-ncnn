@@ -35,8 +35,15 @@ ncnn ROPE/RotaryEmbed 的 Vulkan 实现 —— 上游 [PR #6834](https://github.
 3rdparty/ncnn   # submodule：ncnn 源码，构建时自动应用 patches/
 patches/        # 按前缀数字排序，逐个 git apply（幂等，已应用会跳过）
 src/            # 运行时 + tokenizer + image_utils + json
-models/         # 外部目录，通过 --model 引用，不随工程提交
+models/         # 外部模型目录，通过 --model 引用，不随工程提交
 ```
+
+## 模型
+模型提供 fp16 与 fp32 两种动态导出，下载后通过 `--model` 目录引用：
+- fp32 动态：[`locate-anything-fp32`](通过网盘分享的文件：locate-anything-fp32
+链接: https://pan.baidu.com/s/1qXqw-c4yRUOyMuUuqwqtUQ?pwd=ybfk 提取码: ybfk 
+--来自百度网盘超级会员v7的分享)
+- fp16 动态：[`locate-anything-fp16`](https://www.modelscope.cn/models/sizeofbeer/locate-anything-fp16)
 
 ## 依赖 / 构建
 ```bash
