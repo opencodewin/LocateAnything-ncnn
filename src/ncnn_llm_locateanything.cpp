@@ -81,8 +81,8 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
 
         // 视觉后端开关：--vision-vulkan（或 LA_VISION_VK=1）可让视觉 3 子图走 Vulkan；
         // 但 Vulkan 必须先由 --vulkan 开启（否则设备未初始化，开关无效、视觉仍 CPU）。
-        // 精度统一由 create_option() 按 --fp16 控制，不在此写死——fp16 在 Vulkan 上的问题
-        // 修好后，--fp16 对视觉/GPU 自然生效。
+        // 精度统一由 create_option() 按 --fp16 控制，不在此写死：--fp16 现走
+        // zimage 方案（2 字节存储 bf16/fp16 + 计算恒 fp32），对视觉/文本子图一致生效。
         const bool vision_switch = vision_use_vulkan
                                    || (getenv("LA_VISION_VK") && atoi(getenv("LA_VISION_VK")) != 0);
         const bool vision_vk = vulkan_ && vision_switch;
@@ -105,7 +105,7 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
             return net;
         };
         // 视觉链：默认 CPU，--vision-vulkan 时切 Vulkan；精度与文本一致由 --fp16 控制。
-        // 注意：Vulkan 下 fp16 计算当前视觉前向与文本 decoder 均发散，--fp16 暂不可用（见 README 已知问题）。
+        // (zimage 方案：fp16 算术已关闭，--fp16 仅启用 2 字节存储，计算恒 fp32）
         net_vision_embed_    = load_net("vision_embed", /*is_vision=*/true);
         net_vision_encoder_  = load_net("vision_encoder", /*is_vision=*/true);
         net_vision_projector_ = load_net("vision_projector", /*is_vision=*/true);

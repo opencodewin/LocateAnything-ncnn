@@ -6,26 +6,25 @@
 - 支持动态输入推理（接近原始项目），拆分为 6 个子图：vision_embed / vision_encoder / vision_projector / text_embed / text_decoder(KV) / lm_head。
 - 支持 MTP 并行窗口解码 + 结构化坐标 token（`<box><x1><y1><x2><y2></box>`）；也支持纯逐 token AR 解码（`--no-mtp`，两者输出结果一致）。
 - 图像处理严格按照原始项目中的 `MAX_DIM=1024`：最大边超过 1024 时用 LANCZOS 预缩后，再做自适应 grid。
-- `--vulkan-device <idx>` 支持多 GPU 选卡；`--fp16` 切换推理精度（默认 fp32）；`--weights-in-host`（仅离散 GPU / 非 mac）把模型权重 offload 到系统内存，解决 fp32 超显存。
+- `--vulkan-device <idx>` 支持多 GPU 选卡；`--fp16` 启用 2 字节存储（bf16 优先 / fp16 回退），计算恒为 fp32（默认全 fp32）；`--weights-in-host`（仅离散 GPU / 非 mac）把模型权重 offload 到系统内存，解决 fp32 超显存。
 
 ## 已知问题
 
 ### 平台 × 精度状态
 
-| 后端 | 权重 | 推理 | 结果 |
+| 后端 | 权重 | 存储 / 计算 | 结果 |
 | --- | --- | --- | --- |
-| CPU · Apple Silicon (macOS) | fp16 | fp32 | ✅ 正确 |
-| CPU · Intel x86 (Windows) | fp16 | fp32 | ✅ 正确 |
-| CPU · AMD x86 (Linux) | fp16 | fp32 | ❌ 无输出：ncnn **SDPA 的 x86 实现**在 AMD 上算错（与 AVX512 / Packed Mat 无关） |
-| Vulkan · NVIDIA (1080Ti/5090) | fp16 | fp16 | ❌ 发散（两者一致，故不单是「无 FP16 算术」所致） |
-| Vulkan · NVIDIA | fp16 | fp32 | ⚠️ 默认超显存；`--weights-in-host` 后 ✅ 正确 |
-| Vulkan · NVIDIA | fp32 | fp16 | ❌ 发散（与 fp16 权重行为相同） |
-| Vulkan · NVIDIA | fp32 | fp32 | ⚠️ 默认超显存；`--weights-in-host` 后 ✅ 正确 |
-| Vulkan · Apple M1 Pro (MoltenVK) | fp16 | fp16 | ❌ 发散（selfcheck decoder maxdiff≈20；与 Flash on/off 无关） |
-| Vulkan · Apple M1 Pro (MoltenVK) | fp16 | fp32 | ✅ 正确（selfcheck maxdiff=0，解码与 CPU 一致） |
+| CPU · Apple Silicon (macOS) | fp16 | fp32 计算 | ✅ 正确 |
+| CPU · Intel x86 (Windows) | fp16 | fp32 计算 | ✅ 正确 |
+| CPU · AMD x86 (Linux) | fp16 | fp32 计算 | ❌ 无输出：ncnn **SDPA 的 x86 实现**在 AMD 上算错（与 AVX512 / Packed Mat 无关） |
+| Vulkan · NVIDIA (1080Ti, 本机实测) | fp16/fp32 | 任意（fp32/bf16/fp16 存储 · fp32 计算） | ❌ **一律发散**：纯 fp32 亦错（见下），仅 CPU 正确 → 无法在此卡验证 fp16 修复 |
+| Vulkan · NVIDIA (5090) | fp16/fp32 | bf16 存储（`--fp16`）· fp32 计算 | ⸺ **待回归**（方案已落地，bf16 保留 fp32 指数范围） |
+| Vulkan · NVIDIA (1080Ti) | fp16/fp32 | fp16 存储回退（`--fp16`）· fp32 计算 | ⸺ 待回归（需先解决下方 GPU 通路发散） |
+| Vulkan · Apple M1 Pro (MoltenVK) | fp16/fp32 | fp16/bf16 存储（`--fp16`）· fp32 计算 | ⸺ 待回归 |
 
 > CPU 无 FP16 硬件，其推理精度恒为 fp32。
-> **Vulkan（NVIDIA）行为由推理精度决定，与权重精度（fp16/fp32）无关**：fp16 计算均发散；fp32 计算默认超显存，但加 `--weights-in-host` 将权重 offload 到系统内存后，**fp32 计算正确可运行**（已在 NVIDIA 实测）。故上述 fp16 权重与 fp32 权重各行结果一致。
+> **`--fp16` 的语义**：fp16 **算术**已在 `create_option()` 按 zimage-ncnn-vulkan 方案**关闭**（计算恒 fp32），`--fp16` 仅启用 2 字节**存储**——bf16 优先（无 bf16 存储时回退 fp16）。出发点：fp16 算术在 SDPA softmax / 长序列累加上塌缩或溢出（早期 1080Ti/M1 Pro 均复现 `<ref>!!!…`），而 bf16/存储不引入该问题。
+> **说明（本机实测）**：在下表中那台 1080Ti 上，**Vulkan 即便纯 fp32（fp32 存储 + fp32 计算、非 FA 路径、含/不含 `--weights-in-host`、MTP 开/关）对该模型也发散**（唯一正确路径为 CPU），与早期「Vulkan fp32 ✅」记录不一致。这属于 **GPU 执行通路**（某层 shader / KV cache / 内存排布的独立问题），而非 fp16 数值问题，需另立任务排查。故 fp16 修复**当前无法在 1080Ti 验收**，bf16 路径的回归待 5090 验证。
 
 ### 已修复
 ncnn ROPE/RotaryEmbed 的 Vulkan 实现 —— 上游 [PR #6834](https://github.com/Tencent/ncnn/pull/6834) 修复全宽 `cos/sin` 缓存（2D / vision RoPE），以 patch 形式构建时自动应用。注意其未覆盖 `src/layer/x86/*`；对本工程输入 CPU 侧是 no-op（真正修复的是 Vulkan 缓存步长）。
@@ -60,7 +59,7 @@ cmake --build build
 ```
 - `--vulkan`、`--vulkan-device <idx>`：启用 GPU 与多卡选卡（越界回退 0）。
 - `--vision-vulkan`：让视觉 3 子图（vision_embed / vision_encoder / vision_projector）也走 Vulkan；默认随 `--vulkan` 一致。⚠️ 须 `--vulkan` 已开启，否则无效（Vulkan 设备未初始化，视觉仍 CPU）。当前 MoltenVK 上 6 张子图同载 Vulkan 会 `VK_ERROR_DEVICE_LOST`，故 Apple 平台暂不可用，仅作开关预留。
-- `--fp16`：推理精度，**同时作用于 Vulkan 文本链与视觉链**（不再单独写死，二者一致）。⚠️ Vulkan 下 fp16 计算当前仍有问题（视觉前向与文本 decoder 均发散），暂不可用，见「已知问题 / Vulkan fp16 发散」。
+- `--fp16`：启用 2 字节存储（bf16 优先，设备无 bf16 时回退 fp16），**同时作用于 Vulkan 文本链与视觉链**（二者一致）；计算恒为 fp32。默认全 fp32 存储 + fp32 计算。见「已知问题 / Vulkan fp16 发散」。
 - `--threads N`、`--greedy`、`--max-new-tokens N`。
 - `--weights-in-host`（仅离散 GPU）：权重 offload 到系统内存，缓解设备显存不足。
 - `--save <out.png>`：画框保存（默认 `<image>_locate.png`）；`--no-draw` 关闭。
@@ -81,11 +80,13 @@ cmake --build build --target bench_platform
 - 一致性只衡量平台输出是否彼此相同，不代表检出全部目标（`datas/football.jpg` 有 **8 人**）；检测质量需另用标注数据评估。
 - MTP 与 AR 结果一致；框数差异来自 token 预算截断（一个框恰 6 token，`max_new=20` 仅够 3 框）。跨平台/跨模式对比时 `--max-new-tokens` 须**一致且给足**。
 
-## Vulkan fp16 发散（定位小结）
-Vulkan 下**fp16 计算**在 NVIDIA（1080Ti/5090）与 Apple M1 Pro 上均发散（坐标 token 全 0 → `<ref>!!!…`），而**fp32 计算正确**（selfcheck maxdiff=0，解码与 CPU 一致）。已排除的候选与结论：
+## Vulkan fp16 发散（定位小结与修复）
+早期复现：Vulkan 下 **fp16 算术**在 NVIDIA（1080Ti/5090）与 Apple M1 Pro 上均发散（坐标 token 全 0 → `<ref>!!!…`），而 fp32 计算被认为正确（selfcheck maxdiff=0，解码与 CPU 一致）。定位过程排除项：
 - 非 Flash Attention（fp16 下强制禁用 flash，结果逐位不变）。
 - 非 RoPE（PR #6834 已 patch，fp16 仍发散）。
-- 非「仅文本 decoder」问题：视觉前向（vision_embed / vision_encoder / vision_projector，即视觉子图）在 Vulkan fp16 下同样发散 / 误差大，并非只有文本 decoder（此前误判为「视觉链 fp16 正常、短序列 prefill 故正常」）。
-- 与权重精度无关（fp16 权重与 fp32 权重行为相同，发散来自 **fp16 计算管线**）。
+- 非「仅文本 decoder」问题：视觉前向在 Vulkan fp16 下同样发散。
+- 与权重/存储精度无关（fp16/fp32 权重行为相同）。
 
-剩余嫌疑不只在文本 decoder：视觉前向在 Vulkan fp16 下也发散，说明问题在**通用的 fp16 数值管线**（SDPA / softmax / 累加在较长视觉序列上塌缩或溢出），而非某条特定子图。根治方向：让 fp16 路径使用更高精度（fp32）累加，排查上游是否已有修复。
+**结论**：早期定位为 **fp16 数值管线**（SDPA / softmax / 累加在长视觉序列上塌缩或溢出）发散。**修复**（已落地，对齐 zimage-ncnn-vulkan）：在 `src/ncnn_llm_base.h` 的 `create_option()` 中关闭 `use_fp16_arithmetic`（恒 false），计算一律 fp32；`--fp16` 仅作 2 字节存储——bf16 优先，设备无 bf16 存储（如 Pascal 1080Ti）回退 fp16 存储（逐值精度更高，激活不超 65504 即安全）。
+
+> **当前验收状态（待更新）**：上述 fp16 设计虽已落地，但**未能在本机 1080Ti 上验证**——该卡 Vulkan 对该模型即便纯 fp32（fp32 存储 + fp32 计算、非 FA 路径、`--weights-in-host` 与 MTP 开/关均试）也发散（`<ref><|im_end|>` 或 `<ref>!!!…` → 0 框），唯一正确路径为 CPU。此 GPU 通路发散属于**独立问题**（详见「平台 × 精度状态」），与 fp16 数值修复正交。**bf16 存储路径的回归留待 5090 验证**（`--vulkan --fp16 --weights-in-host` + `bench_platform` 对照 cpu-fp32）。

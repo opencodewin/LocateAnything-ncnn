@@ -113,7 +113,7 @@ protected:
     bool use_vulkan_ = false;
     int num_threads_ = 4;
     int vulkan_device_ = 0;   // 使用的 Vulkan 设备序号（多 GPU 时可指定）
-    bool use_fp16_ = false;   // Vulkan 走 fp16（默认 fp32，供 fp16 测试）
+    bool use_fp16_ = false;   // --fp16：Vulkan 走 2 字节存储（bf16 优先 / fp16 兜底），计算恒 fp32
     bool weights_in_host_ = false; // 权重驻留宿主内存（offload 显存），Vulkan 专用
     bool ok_ = true;
     std::mt19937 rng_{std::random_device{}()};
@@ -139,10 +139,9 @@ protected:
                         vulkan_device_);
                 vulkan_device_ = 0;
             }
-            if (use_fp16_ && cnt > 0 && !ncnn::get_gpu_info(vulkan_device_).support_fp16_arithmetic()) {
-                fprintf(stderr, "[ncnn] WARNING: selected Vulkan device does not support FP16 arithmetic; "
-                                "fp16 storage may be used, but computation falls back from native FP16\n");
-            }
+            // 见 create_option()：fp16 算术已按 zimage 方案关闭，计算恒为 fp32；
+            // --fp16 仅用于 2 字节存储。此时无需再要求设备支持 fp16 算术。
+            (void)use_fp16_;
         }
 #endif
     }
@@ -158,18 +157,39 @@ protected:
     ncnn::Option create_option() const {
         ncnn::Option opt;
         opt.num_threads = num_threads_;
-        opt.use_bf16_storage = false;
         opt.use_vulkan_compute = use_vulkan_;
-        // NCNN defaults all fp16 options to true, so fp32 must explicitly clear
-        // them before enabling the requested Vulkan precision.
+        // NCNN defaults all fp16/bf16 options to true, so the fp32 baseline must
+        // explicitly clear them before enabling the requested Vulkan precision.
         opt.use_fp16_packed = false;
         opt.use_fp16_storage = false;
         opt.use_fp16_arithmetic = false;
-        // fp16 仅作用于 Vulkan 计算链路（--fp16 控制，视觉/文本一致）。
+        opt.use_bf16_packed = false;
+        opt.use_bf16_storage = false;
+        // --fp16 采用 zimage-ncnn-vulkan 的方案：Vulkan 下 fp16 *算术*在注意力
+        // softmax / 长序列累加上会塌缩或溢出而发散（各子图均如此），故一律关闭
+        // fp16 算术，计算恒为 fp32；2 字节带宽目标改由 bf16/fallback fp16 存储
+        // 承担（bf16 保留 fp32 的 8 位指数，SDPA 的 softmax 动态范围不受损）。
         if (use_fp16_) {
-            opt.use_fp16_packed = true;
-            opt.use_fp16_storage = true;
-            opt.use_fp16_arithmetic = true;
+#if NCNN_VULKAN
+            if (use_vulkan_) {
+                const ncnn::GpuInfo& info = ncnn::get_gpu_info(vulkan_device_);
+                if (info.support_bf16_storage()) {
+                    // 首选 bf16 存储（2 字节、指数范围同 fp32）。
+                    opt.use_bf16_packed = true;
+                    opt.use_bf16_storage = true;
+                } else {
+                    // 设备无 bf16 存储（如 NVIDIA Pascal 1080Ti）时回退 fp16 存储：
+                    // 仅省带宽/显存，算术仍是 fp32，不引入 fp16 精度问题。
+                    opt.use_fp16_packed = true;
+                    opt.use_fp16_storage = true;
+                }
+            }
+#else
+            // 非 Vulkan 构建：CPU 无 fp16 硬件，ncnn 恒为 fp32 计算，此开关无实际
+            // 效果，仅保留标志位语义。
+            opt.use_bf16_packed = true;
+            opt.use_bf16_storage = true;
+#endif
         }
 #if NCNN_VULKAN
         if (use_vulkan_) {
