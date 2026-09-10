@@ -6,7 +6,7 @@
 - 支持动态输入推理（接近原始项目），拆分为 6 个子图：vision_embed / vision_encoder / vision_projector / text_embed / text_decoder(KV) / lm_head。
 - 支持 MTP 并行窗口解码 + 结构化坐标 token（`<box><x1><y1><x2><y2></box>`）；也支持纯逐 token AR 解码（`--no-mtp`，两者输出结果一致）。
 - 图像处理严格按照原始项目中的 `MAX_DIM=1024`：最大边超过 1024 时用 LANCZOS 预缩后，再做自适应 grid。
-- `--vulkan-device <idx>` 支持多 GPU 选卡；`--fp16` 切换推理精度（默认 fp32）。
+- `--vulkan-device <idx>` 支持多 GPU 选卡；`--fp16` 切换推理精度（默认 fp32）；`--weights-in-host`（仅离散 GPU / 非 mac）把模型权重 offload 到系统内存，解决 fp32 超显存。
 
 ## 已知问题
 
@@ -63,6 +63,7 @@ cmake --build build
 - `--vulkan`、`--vulkan-device <idx>`：启用 GPU 与多卡选卡（越界回退 0）。
 - `--fp16`：推理精度，仅作用于 Vulkan 文本链；视觉链与 CPU 恒为 fp32。
 - `--threads N`、`--greedy`、`--max-new-tokens N`。
+- `--weights-in-host`（仅离散 GPU）：权重 offload 到系统内存，缓解设备显存不足。
 - `--save <out.png>`：画框保存（默认 `<image>_locate.png`）；`--no-draw` 关闭。
 
 输出除结构化坐标 token 外，会逐框打印归一化/像素坐标；像素 = 归一化 × 原图宽高（`src/utils/draw_utils.h`）。
