@@ -59,9 +59,10 @@ static ncnn::Mat bgr_to_rgb_chw_normalized(const ncnn::Mat& bgr, int target_w, i
 // ============================================================================
 ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
                                                  bool use_vulkan, int num_threads,
-                                                 int vulkan_device, bool use_fp16)
+                                                 int vulkan_device, bool use_fp16,
+                                                 bool weights_in_host)
     : ncnn_llm_base(use_vulkan, num_threads > 0 ? num_threads : 4,
-                    vulkan_device, use_fp16) {
+                    vulkan_device, use_fp16, weights_in_host) {
     try {
         json config;
         {

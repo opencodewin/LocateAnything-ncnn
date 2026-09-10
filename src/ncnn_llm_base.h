@@ -114,13 +114,16 @@ protected:
     int num_threads_ = 4;
     int vulkan_device_ = 0;   // 使用的 Vulkan 设备序号（多 GPU 时可指定）
     bool use_fp16_ = false;   // Vulkan 走 fp16（默认 fp32，供 fp16 测试）
+    bool weights_in_host_ = false; // 权重驻留宿主内存（offload 显存），Vulkan 专用
     bool ok_ = true;
     std::mt19937 rng_{std::random_device{}()};
 
     ncnn_llm_base(bool use_vulkan = false, int num_threads = 4,
-                  int vulkan_device = 0, bool use_fp16 = false)
+                  int vulkan_device = 0, bool use_fp16 = false,
+                  bool weights_in_host = false)
         : use_vulkan_(use_vulkan), num_threads_(num_threads),
-          vulkan_device_(vulkan_device), use_fp16_(use_fp16) {
+          vulkan_device_(vulkan_device), use_fp16_(use_fp16),
+          weights_in_host_(weights_in_host) {
 #if NCNN_VULKAN
         if (use_vulkan) {
             ncnn::create_gpu_instance();
@@ -177,6 +180,13 @@ protected:
             opt.blob_vkallocator = gpu->acquire_blob_allocator();
             opt.staging_vkallocator = gpu->acquire_staging_allocator();
         }
+        // 权重驻留宿主内存（VK_EXT_external_memory_host），不占 device-local 显存，
+        // 用于离散 GPU 显存不足时把模型权重 offload 到系统内存；读权重走 PCIe，可
+        // 能变慢但不超显存。驱动不支持时 allocator 自动回退 device-local。
+        // macOS 为统一内存架构，无显存收益，故不设置。
+#if !defined(__APPLE__)
+        opt.use_weights_in_host_memory = weights_in_host_;
+#endif
 #endif
         return opt;
     }

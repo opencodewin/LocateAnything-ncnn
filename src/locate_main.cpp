@@ -29,6 +29,7 @@ int main(int argc, char** argv) {
     bool use_vulkan = false;
     bool greedy = false;
     bool use_fp16 = false;
+    bool weights_in_host = false;
     int vulkan_device = 0;
     int threads = 4;
     int max_new = 512;
@@ -46,6 +47,10 @@ int main(int argc, char** argv) {
             if (vulkan_device < 0) vulkan_device = 0;
         }
         else if (arg == "--fp16") use_fp16 = true;
+#if !defined(__APPLE__)
+        // macOS 为统一内存架构，host 权重无显存收益，忽略该标志（离散 GPU 才生效）。
+        else if (arg == "--weights-in-host") weights_in_host = true;
+#endif
         else if (arg == "--greedy") greedy = true;
         else if (arg == "--max-new-tokens" && i + 1 < args.size()) {
             max_new = std::stoi(args[++i]);
@@ -61,18 +66,20 @@ int main(int argc, char** argv) {
 
     if (image_path.empty()) {
         fprintf(stderr, "Usage: %s --image <image_path> [--model <model_path>] [--prompt <question>]\n"
-                        "       [--vulkan] [--vulkan-device <idx>] [--fp16] [--threads N]\n"
+                        "       [--vulkan] [--vulkan-device <idx>] [--fp16] [--weights-in-host] [--threads N]\n"
                         "       [--save <out.png>] [--no-draw]\n",
                 argv[0]);
         return 1;
     }
 
-    printf("Loading LocateAnything model from %s (threads=%d, vulkan=%s%s, precision=%s)\n",
+    printf("Loading LocateAnything model from %s (threads=%d, vulkan=%s%s%s, precision=%s)\n",
            model_path.c_str(), threads, use_vulkan ? "on" : "off",
            use_vulkan ? (" device=" + std::to_string(vulkan_device)).c_str() : "",
+           use_vulkan && weights_in_host ? ", weights=host(offload)" : "",
            use_fp16 ? "fp16" : "fp32");
 
-    ncnn_llm_locateanything la(model_path, use_vulkan, threads, vulkan_device, use_fp16);
+    ncnn_llm_locateanything la(model_path, use_vulkan, threads, vulkan_device, use_fp16,
+                               weights_in_host);
     if (!la.ok()) {
         fprintf(stderr, "Failed to load LocateAnything model\n");
         return 1;
