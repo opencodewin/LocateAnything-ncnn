@@ -13,9 +13,12 @@
 // 这是 VLM 目标定位（grounding），不是 OCR 文字识别。
 //
 // 用法:
-//   locate_main --model <models-dir> --image <image> [--prompt <question>] [--vulkan] [--threads N]
+//   locate_main --image <image> [--model <models-dir>] [--prompt <question>]
+//               [--vulkan] [--vulkan-device <idx>] [--fp16] [--weights-in-host]
+//               [--greedy] [--max-new-tokens N] [--threads N]
 //               [--save <out.png>] [--no-draw]
-//   （--model 默认 models/locate-anything-fp16，--image 必填）
+//   （--image 必填；--model 默认 models/locate-anything-fp16；
+//     --weights-in-host 仅在非 macOS 生效，见参数解析处）
 // 默认会把带框的图标注结果写到 <image>_locate.png（--save 指定路径，--no-draw 关闭）。
 
 int main(int argc, char** argv) {
@@ -98,12 +101,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    LocateGenerateConfig cfg;
+    LocateGenerateConfig cfg;   // 采样相关取默认值（temperature/top_p/top_k）
     cfg.max_new_tokens = max_new;
     cfg.do_sample = !greedy;   // --greedy 关闭采样，确定性 argmax（用于与 torch 逐 token 对比定位）
-    cfg.temperature = 0.7f;
-    cfg.top_p = 0.9f;
-    cfg.top_k = 50;
     cfg.repetition_penalty = greedy ? 1.0f : 1.1f;   // greedy 时关掉 rep/采样，纯净 argmax
     // 逐 token 打印到 stderr，便于实时观察 decode 进度（stdout 块缓冲看不动）
     cfg.callback = [](const std::string& t) { fprintf(stderr, "%s", t.c_str()); fflush(stderr); };

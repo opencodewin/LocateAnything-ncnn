@@ -3,12 +3,13 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <cstdlib>
+#include <cstring>
 #include <fstream>
-#include <nlohmann/json.hpp>
 #include <random>
-#include <sstream>
 
+#include <nlohmann/json.hpp>
+
+#include "locate_debug.h"
 #include "utils/image_utils.h"
 
 using json = nlohmann::json;
@@ -16,11 +17,11 @@ using json = nlohmann::json;
 // ============================================================================
 // 工具：把 BGR u8 interleaved（load_image_to_ncnn_mat 结果）适配到 vision_embed
 // 需要的 [1,3,H,W]、RGB、mean=std=0.5 归一化张量。
-// 与 torch LocateAnythingImageProcessor.rescale 保持一致：直接双三次拉伸到
-// 变体画布（448/896/1792），无 letterbox/pad。torch 侧是
-//     target = ceil(尺寸 / (merge*patch)) * (merge*patch)，然后 BICUBIC resize
-// 画布（正方形变体）即该目标；stretch 后模型输出的 0~1000 坐标为相对画布的
-// 均匀映射，调用方按 x/1000*原宽 还原即可，无填充偏移。
+// 与 torch LocateAnythingImageProcessor.rescale 一致：直接双三次拉伸到目标画布，
+// 无 letterbox/pad。画布尺寸由 run_vision_features 算出：
+//     target = ceil(尺寸 / (merge*patch)) * (merge*patch)   （28 的倍数）
+// 画布与原图只差这个向上取整（不足 28px），所以模型输出的 0~1000 坐标按
+// x/1000 还原即为原图的归一化坐标，没有填充偏移。
 // ============================================================================
 static ncnn::Mat bgr_to_rgb_chw_normalized(const ncnn::Mat& bgr, int target_w, int target_h) {
     ncnn::Mat rgb(target_w, target_h, 3);
@@ -74,7 +75,6 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
             ifs >> config;
         }
         model_type_ = config.value("model_type", config.value("type", std::string("locate_anything")));
-        model_path_ = model_path;
         vulkan_ = use_vulkan;
 
         auto load_net = [&](const std::string& key, bool vk) {
@@ -95,21 +95,14 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
             }
             return net;
         };
-        // 视觉链固定 CPU(f32)：视觉特征(fp16 污染会毁整句)，文本默认同走 CPU；仅 --vulkan 时文本实验性走 GPU
+        // 视觉链固定 CPU fp32（fp16 会污染视觉特征、毁掉整句输出）；文本链按 --vulkan
+        // 决定走 GPU 还是 CPU（fp16 只作用于 Vulkan，见 create_option）。
         net_vision_embed_ = load_net("vision_embed", /*vk=*/false);
         net_vision_encoder_ = load_net("vision_encoder", /*vk=*/false);
         net_vision_projector_ = load_net("vision_projector", /*vk=*/false);
         net_text_embed_ = load_net("text_embed", vulkan_);
         net_text_decoder_ = load_net("text_decoder", vulkan_);
         net_lm_head_ = load_net("lm_head", vulkan_);
-        // decode 阶段恒走 CPU 副本（见成员注释）；纯 CPU 模式主副本即 CPU，直接别名省内存
-        if (vulkan_) {
-            net_text_decoder_cpu_ = load_net("text_decoder", /*vk=*/false);
-            net_lm_head_cpu_ = load_net("lm_head", /*vk=*/false);
-        } else {
-            net_text_decoder_cpu_ = net_text_decoder_;
-            net_lm_head_cpu_ = net_lm_head_;
-        }
         if (!net_vision_embed_ || !net_vision_encoder_ || !net_vision_projector_ ||
             !net_text_embed_ || !net_text_decoder_ || !net_lm_head_) {
             fprintf(stderr, "[locateanything] some subgraph failed to load\n");
@@ -145,8 +138,6 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
         head_dim_ = st.value("head_dim", head_dim_);
         layers_ = st.value("layers", layers_);
         kv_heads_ = st.value("kv_heads", kv_heads_);
-        heads_ = st.value("heads", heads_);
-        vocab_ = st.value("vocab", vocab_);
         rope_theta_ = st.value("rope_theta", rope_theta_);
         mask_fill_ = st.value("mask_fill", mask_fill_);
 
@@ -177,15 +168,14 @@ bool ncnn_llm_locateanything::load_pos_emb(const std::string& path) {
         fprintf(stderr, "[locateanything] cannot open pos_emb file %s\n", path.c_str());
         return false;
     }
-    // expected [1, pos_emb_grid_^2, 1152] fp32（原生 64x64，宿主插值源）
+    // 期望 [pos_emb_grid_^2, vision_hidden_] fp32（原生 64x64，宿主插值源）
     size_t n = (size_t)pos_emb_grid_ * pos_emb_grid_ * vision_hidden_;
-    pos_emb_.create(1152, (int)(pos_emb_grid_ * pos_emb_grid_));
+    pos_emb_.create(vision_hidden_, (int)(pos_emb_grid_ * pos_emb_grid_));
     pos_emb_.fill(0.f);
     ifs.read((char*)pos_emb_.data, (std::streamsize)(n * sizeof(float)));
     return !ifs.fail();
 }
 
-// 从 model.json setting.vision.variants 载入各档视觉变体。
 // 宿主端 2x2 patch_merger（mirror 官方 patch_merger 的 view+permute 重排，无权重无插值）：
 //   body=[L, v_dim]（L=gh*gw）-> out=[(gh/2)*(gw/2), 4*v_dim]。
 //   out[rm, cx] 的第 (i,j) 个 merge 块、维度 d 取自 body 行 (rm*2+i)*gw + cx*2 + j。纯 gather。
@@ -358,16 +348,10 @@ ncnn::Mat ncnn_llm_locateanything::causal_mask(int seq) {
 // 个坑（见 run_vision_features 里对 encoder 输出的重新装箱）。
 //
 // 因此所有子图输出统一先解包到 elempack=1，再摊平成规范 2D（w=dim，h=rows）。
-static void la_shape(const char* tag, const ncnn::Mat& m) {
-    static std::unordered_set<std::string> seen;
-    std::string key = tag;
-    if (seen.insert(key).second)
-        fprintf(stderr, "[locateanything] SHAPE %s dims=%d w=%d h=%d c=%d pack=%d es=%zu\n",
-                tag, m.dims, m.w, m.h, m.c, m.elempack, m.elemsize);
-}
+//
+// 解包 + 摊平两步都可能失败/走样，故保留 NOTE/WARN 输出：pack>1 说明该后端的
+// packing 与宿主假设不符，w!=expect_w 说明宿主对子图形状的理解已经过时。
 
-// 一行统计：w/h/min/max/nan 个数。NaN 会让 greedy argmax 恒返回下标 0（比较全 false），
-// 表现为 commit 全 0、一个框都解不出来，所以这里显式把 NaN 数出来。
 // elempack -> 1（已是 1 时零成本返回原 Mat）
 static ncnn::Mat la_unpack(const ncnn::Mat& src, const char* tag) {
     if (src.elempack == 1) return src;
@@ -387,7 +371,7 @@ static ncnn::Mat la_unpack(const ncnn::Mat& src, const char* tag) {
 
 // 摊平成规范 2D Mat（w=expect_w，h=行数）。dims=3 且 c>1 时按"c 主序、y 次序"摊平。
 static ncnn::Mat la_canonical_2d(const ncnn::Mat& src, int expect_w, const char* tag) {
-    la_shape(tag, src);
+    LA_SHAPE(tag, src);
     ncnn::Mat m = la_unpack(src, tag);
     if (m.dims == 2 && m.w == expect_w) return m;
     if (m.dims == 1 && m.w == expect_w) {
@@ -410,7 +394,7 @@ static ncnn::Mat la_canonical_2d(const ncnn::Mat& src, int expect_w, const char*
 
 // KV cache：保持 dims=3（w=head_dim, h=rows, c=kv_heads），只解包
 static ncnn::Mat la_canonical_kv(const ncnn::Mat& src, const char* tag) {
-    la_shape(tag, src);
+    LA_SHAPE(tag, src);
     ncnn::Mat m = la_unpack(src, tag);
     if (m.dims != 3)
         fprintf(stderr, "[locateanything] WARN %s: unexpected dims=%d (expect 3)\n", tag, m.dims);
@@ -418,8 +402,8 @@ static ncnn::Mat la_canonical_kv(const ncnn::Mat& src, const char* tag) {
 }
 
 ncnn::Mat ncnn_llm_locateanything::run_text_embed(const std::vector<int>& ids) {
-    ncnn::Mat in((int)ids.size(), 1, (void*)ids.data());
-    in = in.clone();
+    ncnn::Mat in((int)ids.size(), 1);
+    std::memcpy(in.data, ids.data(), ids.size() * sizeof(int));
     ncnn::Mat out;
     ncnn::Extractor ex = net_text_embed_->create_extractor();
     ex.input("in0", in);
@@ -430,7 +414,8 @@ ncnn::Mat ncnn_llm_locateanything::run_text_embed(const std::vector<int>& ids) {
 ncnn::Mat ncnn_llm_locateanything::run_decoder(const ncnn::Mat& emb, const ncnn::Mat& cos,
                                                const ncnn::Mat& sin, const ncnn::Mat& mask,
                                                KVCache& kv, bool is_prefill) {
-    // 文本统一走主副本（--vulkan 时为 Vulkan，含 decode；否则为 CPU）
+    // 文本链只有一份 net：--vulkan 时是 Vulkan 版（prefill 与 decode 同走它），
+    // 否则是 CPU 版。
     ncnn::Net* net = net_text_decoder_.get();
     ncnn::Mat out;
     ncnn::Extractor ex = net->create_extractor();
@@ -475,15 +460,16 @@ ncnn::Mat ncnn_llm_locateanything::run_lm_head(const ncnn::Mat& hidden) {
     ncnn::Extractor ex = net_lm_head_->create_extractor();
     ex.input("in0", hidden);
     ex.extract("out0", out);
-    la_shape("lm_head.out0", out);
+    LA_SHAPE("lm_head.out0", out);
     return la_unpack(out, "lm_head.out0");
 }
 
 // ============================================================================
 // MTP 并行窗口（block_size=6）解码。移植 torch 的 multi-token-prediction 路径：
-//   一次 forward 输入 [rep | mask_tok*(k-1)]（位置 past-1..），KV 只由这些输入
-//   （含 mask 占位）的 embed 计算并累积；输出每位置 hidden，lm_head 得到 6 个
-//   并行 logits -> decode_bbox_avg 整段提交 <box>..</box>。
+//   一次 forward 输入 [未缓存的真实 token... | rep | mask_tok × (block-1)]，
+//   窗口行位置取 L..L+block-1（L = 当前 stream 长度，见 decode_loop_mtp）；
+//   输出每位置 hidden，lm_head 得到 6 个并行 logits -> decode_bbox_avg 整段提交
+//   <box>..</box>。
 // 这与 torch hybrid_runtime 的 N_FUTURE 一致，从而复现 torch 的框（x/y 全对齐）。
 // ============================================================================
 
@@ -812,9 +798,9 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         // ---- MTP 窗口 ----
         int L = (int)stream.size();
         int past = (int)kv[0].first.h;
-        fprintf(stderr, "[locateanything] WINSTATE L=%d past=%d cache_len=%d blk=%d kvh(w=%d h=%d c=%d pack=%d)\n",
-                L, past, cache_len, block_size_, kv[0].first.w, kv[0].first.h, kv[0].first.c,
-                kv[0].first.elempack);
+        LA_TRACE("WINSTATE L=%d past=%d cache_len=%d blk=%d kvh(w=%d h=%d c=%d pack=%d)\n",
+                 L, past, cache_len, block_size_, kv[0].first.w, kv[0].first.h, kv[0].first.c,
+                 kv[0].first.elempack);
         // 块 = [未缓存真实 token][rep=stream[-1]][mask_tok × (block-1)]
         std::vector<int> blk;
         for (int i = cache_len; i < L; i++) blk.push_back(stream[i]);
@@ -847,22 +833,22 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         std::string type;
         std::vector<int> commit = mtp_window_decode(win, type, cfg);
 
-        fprintf(stderr, "[locateanything] WINDOW type=%s commit=[", type.c_str());
-        for (size_t z = 0; z < commit.size(); z++) fprintf(stderr, "%s%d", z ? "," : "", commit[z]);
-        fprintf(stderr, "] stream=%zu limit=%d\n", stream.size(), limit);
+        LA_TRACE("WINDOW type=%s commit=%s stream=%zu limit=%d\n", type.c_str(),
+                 locate_dbg::join_ids(commit).c_str(), stream.size(), limit);
 
         for (int t : commit) stream.push_back(t);
         emit(commit);
         if (type == "im_end") break;
         trim_kv(kv, L);                                   // 丢弃窗口，KV 只留真实 [0:L)
-        fprintf(stderr, "[locateanything] KVSTAT after-trim rows=%d (w=%d h=%d c=%d pack=%d) expect=%d\n",
-                (int)kv[0].first.h, kv[0].first.w, kv[0].first.h, kv[0].first.c,
-                kv[0].first.elempack, L);
+        LA_TRACE("KVSTAT after-trim rows=%d (w=%d h=%d c=%d pack=%d) expect=%d\n",
+                 (int)kv[0].first.h, kv[0].first.w, kv[0].first.h, kv[0].first.c,
+                 kv[0].first.elempack, L);
         cache_len = L;                                    // 真实 token 缓存到 L（提交前）
         if (type == "error_box") in_mtp = false;          // 出错 -> AR
         // coord_box / point_box / empty_box / ref_object 继续 MTP
     }
-    fprintf(stderr, "[locateanything] LOOP-END stream=%zu limit=%d last=%d\n", stream.size(), limit, stream.empty() ? -1 : stream.back());
+    LA_TRACE("LOOP-END stream=%zu limit=%d last=%d\n", stream.size(), limit,
+             stream.empty() ? -1 : stream.back());
 }
 
 // 纯逐 token AR 生成循环：每步在增量位置因果前向、采样 1 个新 token 追加进 KV，
@@ -913,19 +899,21 @@ void ncnn_llm_locateanything::decode_loop_ar(std::string& out_text, std::vector<
         stream.push_back(next);
         emit({next});
         history.insert(next);
-        fprintf(stderr, "[locateanything] AR tok=%d (pos=%d)\n", next, pos);
+        LA_TRACE("AR tok=%d (pos=%d)\n", next, pos);   // pos = next 下一轮作为输入时的位置
         if (next == eos_id_ || next == im_end_id_) break;
     }
-    fprintf(stderr, "[locateanything] AR-LOOP-END stream=%zu limit=%d last=%d\n",
-            stream.size(), limit, stream.empty() ? -1 : stream.back());
+    LA_TRACE("AR-LOOP-END stream=%zu limit=%d last=%d\n", stream.size(), limit,
+             stream.empty() ? -1 : stream.back());
 }
 
-// 视觉链：返回 [1, n_image_tokens, hidden] 图像特征（image_features 承载该 Mat）
-ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
-                                                       ncnn::Mat& image_features) {
+// 视觉链：embed -> encoder -> 宿主 2x2 patch_merge -> projector。
+// 图像特征写入 image_features（Mat(hidden_, M)），M = (gh/2)*(gw/2) 同时写入
+// n_image_tokens_（prompt 里 <IMG_CONTEXT> 的个数必须与它相等）。
+void ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
+                                                  ncnn::Mat& image_features) {
     // 1) torch 参考 load_pil 先对 max(w,h)>MAX_DIM(=1024) 的图做 LANCZOS 预缩到
     //    1024（hybrid_runtime.load_pil，Image.LANCZOS）。缺这一步会导致 ncnn 直喂
-    //    原图、grid 与 torch 不一致（§7.6/§7.10.1 大图预处理缺口）。预缩后再算 grid。
+    //    原图、grid 与 torch 不一致。预缩失败则退回原图继续（总比空图崩掉好）。
     int ow = bgr.w, oh = bgr.h;
     ncnn::Mat work = bgr;
     const int MAX_DIM = 1024;
@@ -933,8 +921,13 @@ ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
         const double s = (double)MAX_DIM / std::max(ow, oh);
         int tw = (int)std::lround(ow * s), th = (int)std::lround(oh * s);
         tw = std::max(1, tw); th = std::max(1, th);
-        work = ncnn_mat_resize_lanczos(bgr, tw, th);
-        ow = work.w; oh = work.h;
+        ncnn::Mat rz = ncnn_mat_resize_lanczos(bgr, tw, th);
+        if (!ncnn_mat_empty(rz)) {
+            work = rz;
+            ow = work.w; oh = work.h;
+        } else {
+            fprintf(stderr, "[locateanything] WARN lanczos pre-resize failed, use original size\n");
+        }
     }
     // 处理器 rescale 复刻：target = ceil(尺寸/28)*28（merge*patch=28），保纵横比、无填充。
     //    超大图再按 in_token_limit 等比缩。对应 LocateAnythingImageProcessor.rescale。
@@ -969,10 +962,10 @@ ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
     ncnn::Mat v1;
     { ncnn::Extractor ex = net_vision_encoder_->create_extractor();
       ex.input("in0", v0); ex.input("in1", vcos); ex.input("in2", vsin); ex.extract("out0", v1); }
-    // 关键：encoder 输出 Mat 若跨子图直喂，会被误读 shape（pack/拓扑元数据）。
-    // 重新装箱成规范 fp32 2D Mat 再喂 patch_merge/投影（实测 raw 给 h=1，rebox 给 h=256）。
-    // 现在统一走 la_canonical_2d：先把可能的 pack4/pack8 解包（不同 CPU 架构的 ncnn
-    // packing 支持不同，AVX512 等平台会返回 pack8），再摊平成 [dim, L]。
+    // 关键：encoder 输出 Mat 若跨子图直喂，会被误读 shape（pack/拓扑元数据，实测
+    // raw 拿到 h=1）。重新装箱成规范 fp32 2D Mat 再喂 patch_merge/投影：统一走
+    // la_canonical_2d 先解包可能的 pack4/pack8（不同 CPU 架构的 ncnn packing 支持
+    // 不同，AVX512 等平台会返回 pack8），再摊平成 [dim, L]。
     ncnn::Mat v1b = la_canonical_2d(v1, vision_hidden_, "vision_encoder.out0");
     // 宿主 2x2 patch_merge（不再留在 encoder 图里）
     ncnn::Mat v1m;
@@ -984,7 +977,6 @@ ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
     vfeat = la_canonical_2d(vfeat, hidden_, "vision_projector.out0");
     n_image_tokens_ = (grid_h_ / merge_) * (grid_w_ / merge_);
     image_features = vfeat;
-    return vfeat;
 }
 
 // ============================================================================

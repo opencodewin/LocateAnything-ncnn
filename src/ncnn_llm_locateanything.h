@@ -8,7 +8,6 @@
 
 #include <mat.h>
 #include <net.h>
-#include <nlohmann/json.hpp>
 
 #include "ncnn_llm_base.h"
 #include "utils/draw_utils.h"
@@ -22,19 +21,22 @@
 // cache_v<i> / out_cache_k<i> / out_cache_v<i>（与 ncnn_text_runtime 的
 // in1=mask,in2=cos,in3=sin 顺序不同，故不复用而由本类自驱）。
 //
-// 输入序（都来自 universal export 的 pnnx 命名；以下为基础档 448 形状，实际按
-// 选档后的变体（896/1792）替换）：
-//   vision_embed         in0=image[1,3,448,448]  in1=pos_emb[1,1024,1152] -> out0[1,1024,1152]
-//   vision_encoder       in0=[1,1024,1152] in1/2=cos/sin[1024,36]        -> out0[1,256,4608]
-//   vision_projector     in0=[1,256,4608]                                 -> out0[1,256,2048]
-//   text_embed           in0=ids[1,S] (int)                               -> out0[1,S,2048]
-//   text_decoder         in0=emb in1=cos in2=sin in3=mask (+KV)           -> out0[1,S,2048]
-//   lm_head              in0=hidden[1,1,2048]                             -> out0 logits[1,1,vocab]
+// 子图输入（pnnx 命名）。L = gh*gw 是**随输入图像变化**的 patch 网格长度，
+// M = (gh/2)*(gw/2) = L/4 是 2x2 patch_merge 后的图像 token 数：
+//   vision_embed      in0=image[1,3,H,W]   in1=pos_emb[1,L,1152] -> out0[1,L,1152]
+//   vision_encoder    in0=[1,L,1152] in1/2=cos/sin[L,36]         -> out0[1,L,1152]
+//   vision_projector  in0=[1,M,4608]（宿主 patch_merge 的输出）   -> out0[1,M,2048]
+//   text_embed        in0=ids[1,S] (int)                          -> out0[1,S,2048]
+//   text_decoder      in0=emb in1=cos in2=sin in3=mask (+KV)      -> out0[1,S,2048]
+//   lm_head           in0=hidden[1,1,2048]                        -> out0 logits[1,1,vocab]
 //
-// Grounding 流程：图像直接双三次拉伸到选档画布（448/896/1792，与 torch 处理器
-// rescale 一致，无 letterbox）-> vision 链得到 256/1024/4096 个图像 token ->
-// 把 prompt 里对应个数的 <IMG_CONTEXT>(id=image_token) 位置 scatter 进 text_embed
-// 输出 -> decoder prefill+decode(KV) -> lm_head 采样（AR / "slow" 模式）。
+// 视觉是"单套动态图 + 宿主插值"，没有 448/896/1792 静态变体：图像先按处理器规则
+// 缩到 target = ceil(尺寸/28)*28（28 = merge*patch），网格 gh/gw = target/14，
+// pos_emb 由原生 64x64 权重在宿主做 torch 语义的 bicubic 插值到 [L,1152]。
+//
+// Grounding 流程：图像 -> vision 链得到 M 个图像 token -> 把 prompt 里对应个数的
+// <IMG_CONTEXT>(id=image_token) 位置 scatter 进 text_embed 输出 -> decoder
+// prefill + decode(KV) -> lm_head 采样（MTP 并行窗口，或纯逐 token AR）。
 // 输出为带结构化坐标 token 的文本，例如 "<box><x1><y1><x2><y2></box>"。
 
 struct LocateGenerateConfig {
@@ -54,9 +56,8 @@ public:
                             int vulkan_device = 0, bool use_fp16 = false, bool weights_in_host = false);
 
     bool ok() const { return ok_; }
-    const std::string& model_type() const { return model_type_; }
 
-    // 端到端 grounding：rgb_image 为 load_image_to_ncnn_mat 的结果（BGR u8 interleaved），
+    // 端到端 grounding：bgr_image 为 load_image_to_ncnn_mat 的结果（BGR u8 interleaved），
     // question 为自然语言 query/指令。返回模型生成的原始文本（含 <box><x1><y1><x2><y2></box>
     // 结构化坐标 token，坐标量化到 0~1000）。
     std::string run(const ncnn::Mat& bgr_image, const std::string& question,
@@ -73,7 +74,9 @@ private:
     void text_rope_cos_sin_at(const std::vector<int>& pos, ncnn::Mat& cos, ncnn::Mat& sin);
     void moon_rope_cos(int grid_h, int grid_w, ncnn::Mat& cos, ncnn::Mat& sin);
     ncnn::Mat causal_mask(int seq);
-    ncnn::Mat run_vision_features(const ncnn::Mat& bgr, ncnn::Mat& image_features);
+    // 跑完整视觉链，图像特征写入 image_features（Mat(hidden_, M)），并更新
+    // grid_h_/grid_w_/n_image_tokens_。
+    void run_vision_features(const ncnn::Mat& bgr, ncnn::Mat& image_features);
     ncnn::Mat run_text_embed(const std::vector<int>& ids);
     ncnn::Mat run_decoder(const ncnn::Mat& emb, const ncnn::Mat& cos, const ncnn::Mat& sin,
                           const ncnn::Mat& mask, KVCache& kv, bool is_prefill);
@@ -88,8 +91,6 @@ private:
     // 宿主端动态视觉（v3）：网络按实际网格任意喂，pos_emb 用原生 64x64 权重做
     // torch 语义的 bicubic（align_corners=False）插值，patch_merger 移到宿主。
     void host_bicubic_pos_emb(int grid_h, int grid_w, ncnn::Mat& out);  // out=[gh*gw, dim]
-    // 当前网格（run_vision_features 内更新）下的图像 token 数
-    int image_token_count() const { return n_image_tokens_; }
     // 构建 [past+K, K] 的 MTP 块掩码：前 (K-block) 行为纯因果（重喂的真实 token），
     // 后 block 行（窗口）窗口内双向可见、屏蔽窗口前一键（索引 past+K-block-1）。
     ncnn::Mat mtp_mask(int K, int past);
@@ -118,26 +119,19 @@ private:
     std::shared_ptr<ncnn::Net> net_text_embed_;
     std::shared_ptr<ncnn::Net> net_text_decoder_;
     std::shared_ptr<ncnn::Net> net_lm_head_;
-    // decode 阶段的 CPU 副本：ncnn Vulkan 对动态 shape 的 decode(seq=1 + KV 递增)
-    // 会落到 CPU 且每次搬迁，实测比纯 CPU 更慢；故 decode 固定走 CPU 副本。
-    std::shared_ptr<ncnn::Net> net_text_decoder_cpu_;
-    std::shared_ptr<ncnn::Net> net_lm_head_cpu_;
 
     std::shared_ptr<BpeTokenizer> bpe_;
-    ncnn::Mat pos_emb_;  // 原生 64x64 pos_emb = [1,4096,1152] fp32（宿主插值源）
+    ncnn::Mat pos_emb_;  // 原生 64x64 pos_emb = [4096,1152] fp32（宿主插值源）
 
-    std::string model_type_;
-    std::string model_path_;  // 模型目录（变体装载用）
+    std::string model_type_;   // 仅用于初始化日志
     bool ok_ = false;
-    bool vulkan_ = false;  // 主 6 子图是否走 Vulkan；decode 恒走 CPU
+    bool vulkan_ = false;   // 文本链是否走 Vulkan（视觉链恒 CPU，见构造函数）
 
     // ---- text / LLM 配置 ----
     int hidden_ = 2048;
     int head_dim_ = 128;
     int layers_ = 36;
     int kv_heads_ = 2;      // GQA 的 kv 头数 = 导出图暴露的 cache 通道数（动态，随 config）
-    int heads_ = 16;        // 注意力头数（k/v 在图内 Tile 到 heads 再喂 SDPA，不在 cache 接口暴露）
-    int vocab_ = 152681;
     double rope_theta_ = 1e6;
     float mask_fill_ = -10000.0f;
 

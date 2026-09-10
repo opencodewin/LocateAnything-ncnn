@@ -13,8 +13,10 @@
 // 统计端到端耗时，并以 CPU-fp32 输出为参考衡量其它平台的文本一致性。
 //
 // 用法:
-//   bench_platform --image <img> [--model <dir>] [--prompt <q>]
-//                  [--threads N] [--vulkan-device <idx>] [--iter N]
+//   bench_platform --image <img> [--model <dir>] [--prompt <q>] [--threads N]
+//                  [--vulkan-device <idx>] [--max-new-tokens N] [--iter N]
+//                  [--no-mtp]   纯逐 token AR（对比 MTP 窗口解码）
+//                  [--cpu-only] 只跑 cpu-fp32，跳过两个 GPU 配置
 //                  [--save-dir <dir>]  每个配置把带框标注图写到 <dir>/<label>.png
 
 namespace {
@@ -117,17 +119,14 @@ int main(int argc, char** argv) {
     cfg.max_new_tokens = max_new;
     cfg.do_sample = false;  // greedy：确定性解码，保证跨平台可比
     cfg.use_mtp = use_mtp;
-    cfg.temperature = 0.7f;
-    cfg.top_p = 0.9f;
-    cfg.top_k = 50;
     cfg.repetition_penalty = 1.0f;
-    cfg.callback = [](const std::string&) { /* bench 不逐 token 打 */ };
+    // callback 留空：bench 只关心最终文本与框，不逐 token 打印
 
     std::string ref_text;
     bool have_ref = false;
 
     for (const auto& c : kConfigs) {
-        if (cpu_only && c.vulkan) continue;   // --cpu-only：跳过已知错误的 GPU 路径
+        if (cpu_only && c.vulkan) continue;   // --cpu-only：只跑 cpu-fp32，跳过两个 GPU 配置
         printf("--- %s ---\n", c.label);
         std::string out;
         std::vector<LocateBox> boxes;
