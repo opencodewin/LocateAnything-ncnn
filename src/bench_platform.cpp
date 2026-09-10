@@ -15,6 +15,8 @@
 // 用法:
 //   bench_platform --image <img> [--model <dir>] [--prompt <q>] [--threads N]
 //                  [--vulkan-device <idx>] [--max-new-tokens N] [--iter N]
+//                  [--vision-vulkan] 视觉 3 子图也走 Vulkan（须 --vulkan 已开启，否则无效）
+//                  [--weights-in-host] 权重 offload 到系统内存（仅离散 GPU / 非 mac，缓解 fp32 超显存）
 //                  [--no-mtp]   纯逐 token AR（对比 MTP 窗口解码）
 //                  [--cpu-only] 只跑 cpu-fp32，跳过两个 GPU 配置
 //                  [--save-dir <dir>]  每个配置把带框标注图写到 <dir>/<label>.png
@@ -68,6 +70,8 @@ int main(int argc, char** argv) {
     int iters = 3;
     bool use_mtp = true;
     bool cpu_only = false;
+    bool vision_vulkan = false;
+    bool weights_in_host = false;
     std::string save_dir;
 
     for (size_t i = 1; i < args.size(); i++) {
@@ -86,7 +90,15 @@ int main(int argc, char** argv) {
             if (max_new <= 0) max_new = 512;
         } else if (a == "--no-mtp") {
             use_mtp = false;
-        } else if (a == "--cpu-only") {
+        } else if (a == "--vision-vulkan") {
+            vision_vulkan = true;
+        }
+#if !defined(__APPLE__)
+        else if (a == "--weights-in-host") {
+            weights_in_host = true;
+        }
+#endif
+        else if (a == "--cpu-only") {
             cpu_only = true;
         } else if (a == "--iter" && i + 1 < args.size()) {
             iters = std::stoi(args[++i]);
@@ -100,7 +112,7 @@ int main(int argc, char** argv) {
         fprintf(stderr,
             "Usage: %s --image <img> [--model <dir>] [--prompt <q>]\n"
             "       [--threads N] [--vulkan-device <idx>] [--max-new-tokens N] [--no-mtp] [--iter N]\n"
-            "       [--save-dir <dir>]\n",
+            "       [--vision-vulkan] [--weights-in-host] [--save-dir <dir>]\n",
             argv[0]);
         return 2;
     }
@@ -111,9 +123,9 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    printf("=== bench: model=%s image=%s prompt=\"%s\" threads=%d device=%d max_new=%d iter=%d mode=%s ===\n",
+    printf("=== bench: model=%s image=%s prompt=\"%s\" threads=%d device=%d max_new=%d iter=%d mode=%s vision_vk=%s ===\n",
            model_path.c_str(), image_path.c_str(), prompt.c_str(), threads, vulkan_device,
-           max_new, iters, use_mtp ? "mtp" : "ar");
+           max_new, iters, use_mtp ? "mtp" : "ar", vision_vulkan ? "on" : "off");
 
     LocateGenerateConfig cfg;
     cfg.max_new_tokens = max_new;
@@ -132,7 +144,8 @@ int main(int argc, char** argv) {
         std::vector<LocateBox> boxes;
         std::chrono::duration<double> elapsed(0);
         {
-            ncnn_llm_locateanything la(model_path, c.vulkan, threads, vulkan_device, c.fp16);
+            ncnn_llm_locateanything la(model_path, c.vulkan, threads, vulkan_device, c.fp16,
+                                        weights_in_host, c.vulkan && vision_vulkan);
             if (!la.ok()) {
                 fprintf(stderr, "  FAIL construct/load model\n");
                 continue;

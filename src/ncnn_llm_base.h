@@ -165,7 +165,7 @@ protected:
         opt.use_fp16_packed = false;
         opt.use_fp16_storage = false;
         opt.use_fp16_arithmetic = false;
-        // fp16 仅作用于 Vulkan 计算链路（视觉链与 CPU 副本在 load_net 里强制回 fp32）。
+        // fp16 仅作用于 Vulkan 计算链路（--fp16 控制，视觉/文本一致）。
         if (use_fp16_) {
             opt.use_fp16_packed = true;
             opt.use_fp16_storage = true;

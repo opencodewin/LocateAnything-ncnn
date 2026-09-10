@@ -30,6 +30,7 @@ int main(int argc, char** argv) {
     std::string prompt;
     bool prompt_set = false;
     bool use_vulkan = false;
+    bool vision_vulkan = false;
     bool greedy = false;
     bool use_fp16 = false;
     bool weights_in_host = false;
@@ -45,6 +46,7 @@ int main(int argc, char** argv) {
         else if (arg == "--image" && i + 1 < args.size()) image_path = args[++i];
         else if (arg == "--prompt" && i + 1 < args.size()) { prompt = args[++i]; prompt_set = true; }
         else if (arg == "--vulkan") use_vulkan = true;
+        else if (arg == "--vision-vulkan") vision_vulkan = true;
         else if (arg == "--vulkan-device" && i + 1 < args.size()) {
             vulkan_device = std::stoi(args[++i]);
             if (vulkan_device < 0) vulkan_device = 0;
@@ -69,7 +71,7 @@ int main(int argc, char** argv) {
 
     if (image_path.empty()) {
         fprintf(stderr, "Usage: %s --image <image_path> [--model <model_path>] [--prompt <question>]\n"
-                        "       [--vulkan] [--vulkan-device <idx>] [--fp16] [--weights-in-host] [--threads N]\n"
+                        "       [--vulkan] [--vision-vulkan] [--vulkan-device <idx>] [--fp16] [--weights-in-host] [--threads N]\n"
                         "       [--save <out.png>] [--no-draw]\n",
                 argv[0]);
         return 1;
@@ -82,7 +84,7 @@ int main(int argc, char** argv) {
            use_fp16 ? "fp16" : "fp32");
 
     ncnn_llm_locateanything la(model_path, use_vulkan, threads, vulkan_device, use_fp16,
-                               weights_in_host);
+                               weights_in_host, vision_vulkan);
     if (!la.ok()) {
         fprintf(stderr, "Failed to load LocateAnything model\n");
         return 1;

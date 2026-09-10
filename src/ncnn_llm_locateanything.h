@@ -53,7 +53,8 @@ struct LocateGenerateConfig {
 class ncnn_llm_locateanything : public ncnn_llm_base {
 public:
     ncnn_llm_locateanything(const std::string& model_path, bool use_vulkan, int num_threads,
-                            int vulkan_device = 0, bool use_fp16 = false, bool weights_in_host = false);
+                            int vulkan_device = 0, bool use_fp16 = false, bool weights_in_host = false,
+                            bool vision_use_vulkan = false);
 
     bool ok() const { return ok_; }
 
@@ -125,7 +126,7 @@ private:
 
     std::string model_type_;   // 仅用于初始化日志
     bool ok_ = false;
-    bool vulkan_ = false;   // 文本链是否走 Vulkan（视觉链恒 CPU，见构造函数）
+    bool vulkan_ = false;   // 文本链是否走 Vulkan；视觉链后端由 --vision-vulkan / LA_VISION_VK 控制，但须 --vulkan 已开启（见构造函数）
 
     // ---- text / LLM 配置 ----
     int hidden_ = 2048;

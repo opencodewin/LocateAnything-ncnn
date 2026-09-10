@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <random>
@@ -61,7 +62,8 @@ static ncnn::Mat bgr_to_rgb_chw_normalized(const ncnn::Mat& bgr, int target_w, i
 ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
                                                  bool use_vulkan, int num_threads,
                                                  int vulkan_device, bool use_fp16,
-                                                 bool weights_in_host)
+                                                 bool weights_in_host,
+                                                 bool vision_use_vulkan)
     : ncnn_llm_base(use_vulkan, num_threads > 0 ? num_threads : 4,
                     vulkan_device, use_fp16, weights_in_host) {
     try {
@@ -77,39 +79,47 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
         model_type_ = config.value("model_type", config.value("type", std::string("locate_anything")));
         vulkan_ = use_vulkan;
 
-        auto load_net = [&](const std::string& key, bool vk) {
+        // 视觉后端开关：--vision-vulkan（或 LA_VISION_VK=1）可让视觉 3 子图走 Vulkan；
+        // 但 Vulkan 必须先由 --vulkan 开启（否则设备未初始化，开关无效、视觉仍 CPU）。
+        // 精度统一由 create_option() 按 --fp16 控制，不在此写死——fp16 在 Vulkan 上的问题
+        // 修好后，--fp16 对视觉/GPU 自然生效。
+        const bool vision_switch = vision_use_vulkan
+                                   || (getenv("LA_VISION_VK") && atoi(getenv("LA_VISION_VK")) != 0);
+        const bool vision_vk = vulkan_ && vision_switch;
+        if (vision_switch && !vulkan_) {
+            fprintf(stderr, "[locateanything] --vision-vulkan ignored: Vulkan disabled (need --vulkan)\n");
+        }
+
+        auto load_net = [&](const std::string& key, bool is_vision) {
             auto net = std::make_shared<ncnn::Net>();
             net->opt = create_option();
-            net->opt.use_vulkan_compute = vk;
-            // 视觉链与 CPU 副本固定 fp32，与 torch 参考一致；fp16 只开给 Vulkan 文本链路。
-            if (!vk) {
-                net->opt.use_fp16_packed = false;
-                net->opt.use_fp16_storage = false;
-                net->opt.use_fp16_arithmetic = false;
-            }
+            // 仅后端（Vulkan/CPU）随子图不同；精度统一交给 create_option（受 --fp16 控制）。
+            net->opt.use_vulkan_compute = is_vision ? vision_vk : vulkan_;
             std::string p = model_path + "/" + config["params"][key]["param"].get<std::string>();
             std::string b = model_path + "/" + config["params"][key]["bin"].get<std::string>();
             if (net->load_param(p.c_str()) != 0 || net->load_model(b.c_str()) != 0) {
-                fprintf(stderr, "[locateanything] fail to load %s (vk=%d)\n", key.c_str(), vk);
+                fprintf(stderr, "[locateanything] fail to load %s (vk=%d)\n", key.c_str(),
+                        net->opt.use_vulkan_compute);
                 return std::shared_ptr<ncnn::Net>();
             }
             return net;
         };
-        // 视觉链固定 CPU fp32（fp16 会污染视觉特征、毁掉整句输出）；文本链按 --vulkan
-        // 决定走 GPU 还是 CPU（fp16 只作用于 Vulkan，见 create_option）。
-        net_vision_embed_ = load_net("vision_embed", /*vk=*/false);
-        net_vision_encoder_ = load_net("vision_encoder", /*vk=*/false);
-        net_vision_projector_ = load_net("vision_projector", /*vk=*/false);
-        net_text_embed_ = load_net("text_embed", vulkan_);
-        net_text_decoder_ = load_net("text_decoder", vulkan_);
-        net_lm_head_ = load_net("lm_head", vulkan_);
+        // 视觉链：默认 CPU，--vision-vulkan 时切 Vulkan；精度与文本一致由 --fp16 控制。
+        // 注意：Vulkan 下 fp16 计算当前视觉前向与文本 decoder 均发散，--fp16 暂不可用（见 README 已知问题）。
+        net_vision_embed_    = load_net("vision_embed", /*is_vision=*/true);
+        net_vision_encoder_  = load_net("vision_encoder", /*is_vision=*/true);
+        net_vision_projector_ = load_net("vision_projector", /*is_vision=*/true);
+        net_text_embed_   = load_net("text_embed", /*is_vision=*/false);
+        net_text_decoder_ = load_net("text_decoder", /*is_vision=*/false);
+        net_lm_head_      = load_net("lm_head", /*is_vision=*/false);
         if (!net_vision_embed_ || !net_vision_encoder_ || !net_vision_projector_ ||
             !net_text_embed_ || !net_text_decoder_ || !net_lm_head_) {
             fprintf(stderr, "[locateanything] some subgraph failed to load\n");
             return;
         }
-        if (use_vulkan) {
-            printf("[locateanything] Vulkan enabled\n");
+        if (use_vulkan || vision_vk) {
+            printf("[locateanything] Vulkan enabled (text=%s vision=%s)\n",
+                   vulkan_ ? "gpu" : "cpu", vision_vk ? "gpu" : "cpu");
         }
 
         // ---- tokenizer ----

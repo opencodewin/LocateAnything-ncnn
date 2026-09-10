@@ -59,7 +59,8 @@ cmake --build build
 ./build/locate_main --model <fp32|fp16 模型目录> --image <img> --prompt <query> [选项]
 ```
 - `--vulkan`、`--vulkan-device <idx>`：启用 GPU 与多卡选卡（越界回退 0）。
-- `--fp16`：推理精度，仅作用于 Vulkan 文本链；视觉链与 CPU 恒为 fp32。
+- `--vision-vulkan`：让视觉 3 子图（vision_embed / vision_encoder / vision_projector）也走 Vulkan；默认随 `--vulkan` 一致。⚠️ 须 `--vulkan` 已开启，否则无效（Vulkan 设备未初始化，视觉仍 CPU）。当前 MoltenVK 上 6 张子图同载 Vulkan 会 `VK_ERROR_DEVICE_LOST`，故 Apple 平台暂不可用，仅作开关预留。
+- `--fp16`：推理精度，**同时作用于 Vulkan 文本链与视觉链**（不再单独写死，二者一致）。⚠️ Vulkan 下 fp16 计算当前仍有问题（视觉前向与文本 decoder 均发散），暂不可用，见「已知问题 / Vulkan fp16 发散」。
 - `--threads N`、`--greedy`、`--max-new-tokens N`。
 - `--weights-in-host`（仅离散 GPU）：权重 offload 到系统内存，缓解设备显存不足。
 - `--save <out.png>`：画框保存（默认 `<image>_locate.png`）；`--no-draw` 关闭。
@@ -74,7 +75,7 @@ cmake --build build --target bench_platform
 ./build/bench_platform --image ../datas/football.jpg --prompt human --max-new-tokens 20 --iter 1  # 快速验证
 ./build/bench_platform --image ../datas/football.jpg --prompt human --iter 3                     # 正式统计
 ```
-可选：`--threads N`、`--max-new-tokens N`、`--vulkan-device <idx>`、`--no-mtp`（纯 AR）、`--cpu-only`（跳过已知不可用的 Vulkan）、`--save-dir <dir>`（每配置存一张带框图）。
+可选：`--threads N`、`--max-new-tokens N`、`--vulkan-device <idx>`、`--no-mtp`（纯 AR）、`--cpu-only`（跳过已知不可用的 Vulkan）、`--vision-vulkan`（视觉 3 子图也走 Vulkan，须 `--vulkan` 已开启、否则对各 GPU 配置无效）、`--weights-in-host`（仅离散 GPU / 非 mac，权重 offload 到系统内存以跑通 Vulkan fp32）、`--save-dir <dir>`（每配置存一张带框图）。
 
 **注意**：
 - 一致性只衡量平台输出是否彼此相同，不代表检出全部目标（`datas/football.jpg` 有 **8 人**）；检测质量需另用标注数据评估。
@@ -84,7 +85,7 @@ cmake --build build --target bench_platform
 Vulkan 下**fp16 计算**在 NVIDIA（1080Ti/5090）与 Apple M1 Pro 上均发散（坐标 token 全 0 → `<ref>!!!…`），而**fp32 计算正确**（selfcheck maxdiff=0，解码与 CPU 一致）。已排除的候选与结论：
 - 非 Flash Attention（fp16 下强制禁用 flash，结果逐位不变）。
 - 非 RoPE（PR #6834 已 patch，fp16 仍发散）。
-- 非通用 fp16 精度（同一模型视觉链 fp16 正确，仅文本 decoder 发散）。
+- 非「仅文本 decoder」问题：视觉前向（vision_embed / vision_encoder / vision_projector，即视觉子图）在 Vulkan fp16 下同样发散 / 误差大，并非只有文本 decoder（此前误判为「视觉链 fp16 正常、短序列 prefill 故正常」）。
 - 与权重精度无关（fp16 权重与 fp32 权重行为相同，发散来自 **fp16 计算管线**）。
 
-剩余嫌疑集中在**文本 decoder 的 fp16 SDPA 数值管线**（fp16 累加精度/softmax 在长序列下塌缩或溢出、KV 增量解码误差累积），视觉链为短序列单次 prefill 故正常。根治方向：让 SDPA 的 fp16 路径使用更高精度（fp32）累加，排查上游是否已有修复。
+剩余嫌疑不只在文本 decoder：视觉前向在 Vulkan fp16 下也发散，说明问题在**通用的 fp16 数值管线**（SDPA / softmax / 累加在较长视觉序列上塌缩或溢出），而非某条特定子图。根治方向：让 fp16 路径使用更高精度（fp32）累加，排查上游是否已有修复。
