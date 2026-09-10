@@ -21,7 +21,8 @@
 | Vulkan · NVIDIA | fp16 | fp32 | ⚠️ 超显存（原因未知） |
 | Vulkan · NVIDIA | fp32 | fp16 | ❌ 发散（与 fp16 权重行为相同） |
 | Vulkan · NVIDIA | fp32 | fp32 | ⚠️ 超显存（与 fp16 权重行为相同） |
-| Vulkan · Apple M1 Pro (MoltenVK) | fp16 | fp16/fp32 | ❌ 全错，一致性仅约 4.6% |
+| Vulkan · Apple M1 Pro (MoltenVK) | fp16 | fp16 | ❌ 发散（selfcheck decoder maxdiff≈20；与 Flash on/off 无关） |
+| Vulkan · Apple M1 Pro (MoltenVK) | fp16 | fp32 | ✅ 正确（selfcheck maxdiff=0，解码与 CPU 一致） |
 
 > CPU 无 FP16 硬件，其推理精度恒为 fp32。
 > **Vulkan（NVIDIA）行为由推理精度决定，与权重精度（fp16/fp32）无关**：fp16 计算均发散，fp32 计算均超显存。故上述 fp16 权重与 fp32 权重各行结果一致。
