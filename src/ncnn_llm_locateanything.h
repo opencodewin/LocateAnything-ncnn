@@ -109,14 +109,6 @@ private:
     // 遇见 eos/im_end 终止。供与 MTP 解码的输出对比（cfg.use_mtp=false 时启用）。
     void decode_loop_ar(std::string& out_text, std::vector<int>& stream, KVCache& kv,
                         const LocateGenerateConfig& cfg, std::unordered_set<int>& history);
-    // 诊断：LA_SELFTEST=1 时，每个子图同时用 Vulkan + CPU 副本喂相同输入，打印 maxdiff。
-    // 用于逐步定位 Vulkan 分歧点（视觉链/embed/prefill/lm_head）。
-    void self_check_vision(const ncnn::Mat& img, const ncnn::Mat& pos);
-    void self_check_decoder_prefill(const ncnn::Mat& vk_hidden, const ncnn::Mat& emb,
-                                    const ncnn::Mat& cos, const ncnn::Mat& sin,
-                                    const ncnn::Mat& mask);
-    void self_check_lm_head(const ncnn::Mat& hidden);
-    static float max_abs_diff(const ncnn::Mat& a, const ncnn::Mat& b);
 
 private:
     // 6 个子图网络
@@ -138,10 +130,6 @@ private:
     std::string model_path_;  // 模型目录（变体装载用）
     bool ok_ = false;
     bool vulkan_ = false;  // 主 6 子图是否走 Vulkan；decode 恒走 CPU
-    bool selftest_ = false;  // LA_SELFTEST=1 开启逐子图 CPU vs Vulkan 对比
-    // 诊断用：CPU 副本（比对主副本是否同样可用）
-    std::shared_ptr<ncnn::Net> st_vision_embed_cpu_, st_vision_encoder_cpu_;
-    std::shared_ptr<ncnn::Net> st_vision_projector_cpu_, st_text_embed_cpu_;
 
     // ---- text / LLM 配置 ----
     int hidden_ = 2048;

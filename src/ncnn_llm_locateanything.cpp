@@ -102,22 +102,13 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
         net_text_embed_ = load_net("text_embed", vulkan_);
         net_text_decoder_ = load_net("text_decoder", vulkan_);
         net_lm_head_ = load_net("lm_head", vulkan_);
-        // CPU 副本仅供 LA_SELFTEST 对比；纯 CPU 模式主副本即 CPU，直接别名省内存
+        // decode 阶段恒走 CPU 副本（见成员注释）；纯 CPU 模式主副本即 CPU，直接别名省内存
         if (vulkan_) {
             net_text_decoder_cpu_ = load_net("text_decoder", /*vk=*/false);
             net_lm_head_cpu_ = load_net("lm_head", /*vk=*/false);
         } else {
             net_text_decoder_cpu_ = net_text_decoder_;
             net_lm_head_cpu_ = net_lm_head_;
-        }
-        // LA_SELFTEST=1：逐子图 CPU vs Vulkan 对比（诊断用，加载 CPU 侧视觉图）
-        selftest_ = std::getenv("LA_SELFTEST") != nullptr && use_vulkan &&
-                    std::getenv("LA_SELFTEST")[0] != '0';
-        if (selftest_) {
-            st_vision_embed_cpu_ = load_net("vision_embed", /*vk=*/false);
-            st_vision_encoder_cpu_ = load_net("vision_encoder", /*vk=*/false);
-            st_vision_projector_cpu_ = load_net("vision_projector", /*vk=*/false);
-            st_text_embed_cpu_ = load_net("text_embed", /*vk=*/false);
         }
         if (!net_vision_embed_ || !net_vision_encoder_ || !net_vision_projector_ ||
             !net_text_embed_ || !net_text_decoder_ || !net_lm_head_) {
@@ -377,45 +368,6 @@ static void la_shape(const char* tag, const ncnn::Mat& m) {
 
 // 一行统计：w/h/min/max/nan 个数。NaN 会让 greedy argmax 恒返回下标 0（比较全 false），
 // 表现为 commit 全 0、一个框都解不出来，所以这里显式把 NaN 数出来。
-static void la_stat_line(const char* tag, const ncnn::Mat& m) {
-    if (m.empty()) {
-        fprintf(stderr, "[locateanything] STAT %s EMPTY (w=%d h=%d c=%d pack=%d)\n", tag, m.w, m.h,
-                m.c, m.elempack);
-        return;
-    }
-    const size_t n = (size_t)m.w * m.h * ((m.dims == 3) ? (size_t)m.c : 1u) * m.elempack;
-    const float* p = (const float*)m.data;
-    float mn = 1e30f, mx = -1e30f;
-    size_t nan_cnt = 0;
-    for (size_t i = 0; i < n; i++) {
-        float v = p[i];
-        if (std::isnan(v)) { nan_cnt++; continue; }
-        if (v < mn) mn = v;
-        if (v > mx) mx = v;
-    }
-    fprintf(stderr, "[locateanything] STAT %s w=%d h=%d c=%d pack=%d n=%zu min=%.4f max=%.4f nan=%zu\n",
-            tag, m.w, m.h, m.c, m.elempack, n, mn, mx, nan_cnt);
-}
-
-// 单行 logits 的指纹：V / 最大值 / argmax / NaN 数（V=0 时 argmax 必然为 0）
-static void la_logits_line(const char* tag, const ncnn::Mat& row) {
-    if (row.empty()) {
-        fprintf(stderr, "[locateanything] LOGITS %s EMPTY (w=%d h=%d)\n", tag, row.w, row.h);
-        return;
-    }
-    const int V = row.w;
-    const float* p = (const float*)row.data;
-    float mx = -1e30f;
-    int arg = 0;
-    size_t nan_cnt = 0;
-    for (int i = 0; i < V; i++) {
-        if (std::isnan(p[i])) { nan_cnt++; continue; }
-        if (p[i] > mx) { mx = p[i]; arg = i; }
-    }
-    fprintf(stderr, "[locateanything] LOGITS %s V=%d max=%.4f argmax=%d nan=%zu\n", tag, V, mx, arg,
-            nan_cnt);
-}
-
 // elempack -> 1（已是 1 时零成本返回原 Mat）
 static ncnn::Mat la_unpack(const ncnn::Mat& src, const char* tag) {
     if (src.elempack == 1) return src;
@@ -881,7 +833,6 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         for (int j = 1; j < block_size_; j++) bpos[m++] = L + j;
 
         ncnn::Mat blk_emb = run_text_embed(blk);          // [hidden,K]
-        la_stat_line("blk_emb", blk_emb);
         ncnn::Mat cos, sin;
         text_rope_cos_sin_at(bpos, cos, sin);
         ncnn::Mat mask = mtp_mask(K, past);
@@ -890,12 +841,9 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         // 窗口 logits = 最后 block_size_ 行
         int w0 = K - block_size_;
         std::vector<ncnn::Mat> win;
-        la_stat_line("decoder.window_hidden", hidden);
         for (int i = w0; i < K; i++) {
             win.push_back(run_lm_head(row_of(hidden, i, hidden_)));   // w=vocab
         }
-        la_logits_line("win0", win[0]);
-        la_logits_line("winLast", win[K - w0 - 1]);
         std::string type;
         std::vector<int> commit = mtp_window_decode(win, type, cfg);
 
@@ -950,9 +898,7 @@ void ncnn_llm_locateanything::decode_loop_ar(std::string& out_text, std::vector<
         if (cur == eos_id_ || cur == im_end_id_) break;
         ncnn::Mat hid = decode_single_causal(cur, pos);
         pos++;
-        la_stat_line("ar.hidden", hid);
         ncnn::Mat lo = run_lm_head(hid);
-        la_logits_line("ar.logits", lo);
         ncnn::Mat l2 = lo.clone();
         if (cfg.repetition_penalty != 1.0f) {
             float* pp = l2;
@@ -1011,7 +957,6 @@ ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
     ncnn::Mat img = bgr_to_rgb_chw_normalized(work, target_w, target_h);
     ncnn::Mat pos;
     host_bicubic_pos_emb(grid_h_, grid_w_, pos);   // [gh*gw, dim]
-    if (selftest_) self_check_vision(img, pos);
 
     // vision_embed: in0=image in1=pos_emb
     ncnn::Mat v0;
@@ -1038,17 +983,6 @@ ncnn::Mat ncnn_llm_locateanything::run_vision_features(const ncnn::Mat& bgr,
       ex.input("in0", v1m); ex.extract("out0", vfeat); }
     vfeat = la_canonical_2d(vfeat, hidden_, "vision_projector.out0");
     n_image_tokens_ = (grid_h_ / merge_) * (grid_w_ / merge_);
-    // LA_DUMP_VISION=<path>：把投影后的 [n_tokens, hidden] fp32 特征 dump 成 .f32，
-    // 供与 torch extract_feature+mlp1 逐元素对比（验证动态导出数值正确性）。
-    if (const char* dump = std::getenv("LA_DUMP_VISION")) {
-        FILE* f = fopen(dump, "wb");
-        if (f) {
-            fwrite(vfeat.data, sizeof(float), (size_t)vfeat.w * vfeat.h, f);
-            fclose(f);
-            fprintf(stderr, "[locateanything] dumped vision features %dx%d grid=%dx%d -> %s\n",
-                    vfeat.w, vfeat.h, grid_h_, grid_w_, dump);
-        }
-    }
     image_features = vfeat;
     return vfeat;
 }
@@ -1114,27 +1048,10 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
                                          const LocateGenerateConfig& cfg) {
     if (!ok_) return std::string();
     std::string out_text;
-    const bool text_only = std::getenv("LA_TEXT_ONLY") != nullptr &&
-                           std::getenv("LA_TEXT_ONLY")[0] != '0';
 
     // 1) 视觉特征
     ncnn::Mat image_features;
-    if (!text_only) {
-        run_vision_features(bgr_image, image_features);
-        const float* fp = image_features;
-        float mn = 1e30f, mx = -1e30f, sm = 0.f;
-        int n = image_features.w * image_features.h;
-        for (int i = 0; i < n; i++) {
-            float v = fp[i];
-            if (v < mn) mn = v;
-            if (v > mx) mx = v;
-            sm += v;
-        }
-        fprintf(stderr, "[locateanything] DEBUG feat w=%d h=%d min=%.3f max=%.3f mean=%.4f\n",
-                image_features.w, image_features.h, mn, mx, sm / std::max(1, n));
-    } else {
-        fprintf(stderr, "[locateanything] LA_TEXT_ONLY=1: skip vision chain\n");
-    }
+    run_vision_features(bgr_image, image_features);
 
     // 2) 拼 prompt：system/user + optional image context + question + assistant
     //    与 torch 的 _tokenize 完全一致：user 文本=_PROMPT + question + "."（见
@@ -1151,24 +1068,22 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     std::string prompt =
         "<|im_start|>system\nYou are a helpful assistant.\n<|im_end|>\n"
         "<|im_start|>user\n";
-    if (!text_only) {
-        prompt += img_ph;
-        for (int i = 0; i < n_image_tokens_; i++) prompt += img_ctx;
-        prompt += img_ph_end;
-    }
+    prompt += img_ph;
+    for (int i = 0; i < n_image_tokens_; i++) prompt += img_ctx;
+    prompt += img_ph_end;
     prompt += user_text + "<|im_end|>\n<|im_start|>assistant\n";
 
     std::vector<int> ids = bpe_->encode(prompt);
     const int S = (int)ids.size();
 
-    // 3) 找到 image token 的位置（text-only 模式不应包含 image token）
+    // 3) 找到 image token 的位置
     std::vector<int> img_pos;
     for (int i = 0; i < S; i++) {
         if (ids[i] == image_token_id_) img_pos.push_back(i);
     }
     printf("[locateanything] prompt seq=%d imgs=%d (expect %d)\n", S, (int)img_pos.size(),
-           text_only ? 0 : n_image_tokens_);
-    if ((int)img_pos.size() != (text_only ? 0 : n_image_tokens_)) {
+           n_image_tokens_);
+    if ((int)img_pos.size() != n_image_tokens_) {
         fprintf(stderr, "[locateanything] image token count mismatch\n");
         return std::string();
     }
@@ -1176,16 +1091,14 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     // 4) embed + 把视觉特征 scatter 进 <IMG_CONTEXT> 所在行
     ncnn::Mat embed = run_text_embed(ids);               // Mat(hidden, S)
     const float* fp = image_features;                     // Mat(hidden, n_image_tokens_)
-    if (!text_only && image_features.w != hidden_) {
+    if (image_features.w != hidden_) {
         fprintf(stderr, "[locateanything] image feature width unexpected %d\n", image_features.w);
         return std::string();
     }
-    if (!text_only) {
-        for (int j = 0; j < n_image_tokens_; j++) {
-            float* dst = embed.row(img_pos[j]);
-            const float* src = fp + (size_t)j * hidden_;
-            std::memcpy(dst, src, (size_t)hidden_ * sizeof(float));
-        }
+    for (int j = 0; j < n_image_tokens_; j++) {
+        float* dst = embed.row(img_pos[j]);
+        const float* src = fp + (size_t)j * hidden_;
+        std::memcpy(dst, src, (size_t)hidden_ * sizeof(float));
     }
 
     // 5) 生成 cos/sin/掩码，prefill 整个序列
@@ -1196,57 +1109,6 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     KVCache kv;
     kv.reserve((size_t)layers_ * 2);
     ncnn::Mat hidden = run_decoder(embed, cos, sin, mask, kv, true);  // Mat(hidden, S)
-    la_stat_line("prefill.embed", embed);
-    la_stat_line("prefill.hidden", hidden);
-    if (selftest_) self_check_decoder_prefill(hidden, embed, cos, sin, mask);
-
-    // last-token hidden -> lm_head（供 selftest 校验；MTP 窗口第 0 行输出即首个生成 token，
-    // 这里不单独提交，交由 decode_loop_mtp 并行窗口产出）
-    ncnn::Mat last(2048, 1);
-    std::memcpy((float*)last.data, hidden.row(S - 1), (size_t)hidden_ * sizeof(float));
-    if (selftest_) self_check_lm_head(last);
-
-    // 跨平台指纹：prompt 末位的 top-5 logits。同模型同输入下各平台必须逐位一致，
-    // 出现分歧即说明子图/链路在某平台发散（用于排查"某 CPU 上不出框"）。
-    {
-        ncnn::Mat lg = run_lm_head(last);
-        const int V = lg.w;
-        std::vector<std::pair<float, int>> top;
-        const float* lp = lg;
-        for (int i = 0; i < V; i++) {
-            if ((int)top.size() < 5) {
-                top.emplace_back(lp[i], i);
-                std::push_heap(top.begin(), top.end(), std::greater<>());
-            } else if (lp[i] > top.front().first) {
-                std::pop_heap(top.begin(), top.end(), std::greater<>());
-                top.back() = std::make_pair(lp[i], i);
-                std::push_heap(top.begin(), top.end(), std::greater<>());
-            }
-        }
-        std::sort(top.begin(), top.end(), std::greater<>());
-        fprintf(stderr, "[locateanything] PREFILL top5 logits(V=%d):", V);
-        for (auto& kv : top) fprintf(stderr, " %d:%.4f", kv.second, kv.first);
-        fprintf(stderr, "\n");
-        // LA_DUMP_TEXT=<prefix>：dump prefill 末位 hidden 与 logits（fp32），
-        // 供跨平台 md5 / 逐元素对比，定位"某平台无输出"的发散点。
-        if (const char* pref = std::getenv("LA_DUMP_TEXT")) {
-            auto dump = [](const std::string& p, const float* d, size_t n) {
-                FILE* f = fopen(p.c_str(), "wb");
-                if (!f) { fprintf(stderr, "[locateanything] dump failed: %s\n", p.c_str()); return; }
-                fwrite(d, sizeof(float), n, f);
-                fclose(f);
-                fprintf(stderr, "[locateanything] dumped %s (%zu floats)\n", p.c_str(), n);
-            };
-            dump(std::string(pref) + "_hidden.f32", (const float*)last.data, (size_t)hidden_);
-            dump(std::string(pref) + "_logits.f32", lp, (size_t)V);
-        }
-        // 视觉特征指纹（text-only 模式没有视觉特征）
-        if (!text_only) {
-            double s = 0.0;
-            for (int i = 0; i < image_features.w * image_features.h; i++) s += fp[i];
-            fprintf(stderr, "[locateanything] FEATSUM %.6f\n", s);
-        }
-    }
 
     // 6) MTP 并行窗口解码（+ AR 回退），对齐 torch generation_mode='hybrid'。
     //    ids 即 prompt token 流，函数内会追加生成 token；out_text 由回调逐 token 累积。
@@ -1259,90 +1121,4 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     // 7) 从生成 token 解析检测框（归一化 [0,1]），供调用方打印/画框。
     collect_boxes(ids, (size_t)S);
     return out_text;
-}
-
-// ============================================================================
-// LA_SELFTEST 逐子图 CPU vs Vulkan 对比（诊断）
-// ============================================================================
-float ncnn_llm_locateanything::max_abs_diff(const ncnn::Mat& a, const ncnn::Mat& b) {
-    if (a.w != b.w || a.h != b.h || a.c != b.c) {
-        fprintf(stderr, "[selfcheck] SHAPE MISMATCH a(w=%d h=%d c=%d) b(w=%d h=%d c=%d)\n",
-                a.w, a.h, a.c, b.w, b.h, b.c);
-        return -1.f;
-    }
-    // 按 fp32 行序比较（两种实现都应产出 fp32 结果，dump 回 CPU）
-    float m = 0.f;
-    for (int ic = 0; ic < a.c; ic++) {
-        const float* pa = a.channel(ic);
-        const float* pb = b.channel(ic);
-        for (int i = 0; i < a.h * a.w; i++) {
-            float d = std::fabs(pa[i] - pb[i]);
-            if (d > m) m = d;
-        }
-    }
-    return m;
-}
-
-void ncnn_llm_locateanything::self_check_vision(const ncnn::Mat& img, const ncnn::Mat& pos) {
-    fprintf(stderr, "[selfcheck]--- vision chain (identical inputs, VK vs CPU) ---\n");
-
-    // vision_embed
-    ncnn::Mat v0;
-    { ncnn::Extractor ex = net_vision_embed_->create_extractor();
-      ex.input("in0", img); ex.input("in1", pos); ex.extract("out0", v0); }
-    ncnn::Mat v0cpu;
-    { ncnn::Extractor ex = st_vision_embed_cpu_->create_extractor();
-      ex.input("in0", img); ex.input("in1", pos); ex.extract("out0", v0cpu); }
-    fprintf(stderr, "[selfcheck] vision_embed    maxdiff=%.4g (w=%d h=%d)\n",
-            max_abs_diff(v0, v0cpu), v0.w, v0.h);
-
-    // vision_encoder：统一喂 CPU 侧 v0（rebox）给两端
-    ncnn::Mat vcos, vsin;
-    moon_rope_cos(grid_h_, grid_w_, vcos, vsin);
-    ncnn::Mat v0b(v0cpu.w, v0cpu.h);
-    memcpy(v0b.data, v0cpu.data, (size_t)v0cpu.w * v0cpu.h * sizeof(float));
-    ncnn::Mat v1, v1cpu;
-    { ncnn::Extractor ex = net_vision_encoder_->create_extractor();
-      ex.input("in0", v0b); ex.input("in1", vcos); ex.input("in2", vsin); ex.extract("out0", v1); }
-    { ncnn::Extractor ex = st_vision_encoder_cpu_->create_extractor();
-      ex.input("in0", v0b); ex.input("in1", vcos); ex.input("in2", vsin); ex.extract("out0", v1cpu); }
-    fprintf(stderr, "[selfcheck] vision_encoder  maxdiff=%.4g (w=%d h=%d)\n",
-            max_abs_diff(v1, v1cpu), v1.w, v1.h);
-
-    // vision_projector：统一喂 CPU 侧 v1（rebox）给两端
-    ncnn::Mat v1b(v1cpu.w, v1cpu.h);
-    memcpy(v1b.data, v1cpu.data, (size_t)v1cpu.w * v1cpu.h * sizeof(float));
-    ncnn::Mat vf, vfcpu;
-    { ncnn::Extractor ex = net_vision_projector_->create_extractor();
-      ex.input("in0", v1b); ex.extract("out0", vf); }
-    { ncnn::Extractor ex = st_vision_projector_cpu_->create_extractor();
-      ex.input("in0", v1b); ex.extract("out0", vfcpu); }
-    fprintf(stderr, "[selfcheck] vision_projector maxdiff=%.4g (w=%d h=%d)\n",
-            max_abs_diff(vf, vfcpu), vf.w, vf.h);
-}
-
-void ncnn_llm_locateanything::self_check_decoder_prefill(const ncnn::Mat& vk_hidden, const ncnn::Mat& emb,
-                                                         const ncnn::Mat& cos, const ncnn::Mat& sin,
-                                                         const ncnn::Mat& mask) {
-    // 同一输入 + 空 KV，CPU decoder 重跑一遍，与主后端(Vulkan) prefill hidden 对比
-    ncnn::Mat out;
-    ncnn::Extractor ex = net_text_decoder_cpu_->create_extractor();
-    ex.input("in0", emb); ex.input("in1", cos); ex.input("in2", sin); ex.input("in3", mask);
-    for (int i = 0; i < layers_; i++) {
-        ncnn::Mat e(head_dim_, 0, kv_heads_);
-        ex.input(("cache_k" + std::to_string(i)).c_str(), e);
-        ex.input(("cache_v" + std::to_string(i)).c_str(), e.clone());
-    }
-    ex.extract("out0", out);
-    fprintf(stderr, "[selfcheck] decoder_prefill  maxdiff=%.4g (w=%d h=%d)\n",
-            max_abs_diff(vk_hidden, out), vk_hidden.w, vk_hidden.h);
-}
-
-void ncnn_llm_locateanything::self_check_lm_head(const ncnn::Mat& hidden) {
-    // 同一 hidden 喂 Vulkan 与 CPU lm_head，对比 logits
-    ncnn::Mat vk, cpu;
-    { ncnn::Extractor ex = net_lm_head_->create_extractor(); ex.input("in0", hidden); ex.extract("out0", vk); }
-    { ncnn::Extractor ex = net_lm_head_cpu_->create_extractor(); ex.input("in0", hidden); ex.extract("out0", cpu); }
-    fprintf(stderr, "[selfcheck] lm_head        maxdiff=%.4g (w=%d)\n",
-            max_abs_diff(vk, cpu), vk.w);
 }
