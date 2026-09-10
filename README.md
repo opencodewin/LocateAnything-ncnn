@@ -19,10 +19,12 @@
 | CPU · AMD x86 (Linux) | fp16 | fp32 | ❌ 无输出：ncnn **SDPA 的 x86 实现**在 AMD 上算错（与 AVX512 / Packed Mat 无关） |
 | Vulkan · NVIDIA (1080Ti/5090) | fp16 | fp16 | ❌ 发散（两者一致，故不单是「无 FP16 算术」所致） |
 | Vulkan · NVIDIA | fp16 | fp32 | ⚠️ 超显存（原因未知） |
-| Vulkan · NVIDIA | fp32 | — | ❓ 未测试 |
+| Vulkan · NVIDIA | fp32 | fp16 | ❌ 发散（与 fp16 权重行为相同） |
+| Vulkan · NVIDIA | fp32 | fp32 | ⚠️ 超显存（与 fp16 权重行为相同） |
 | Vulkan · Apple M1 Pro (MoltenVK) | fp16 | fp16/fp32 | ❌ 全错，一致性仅约 4.6% |
 
 > CPU 无 FP16 硬件，其推理精度恒为 fp32。
+> **Vulkan（NVIDIA）行为由推理精度决定，与权重精度（fp16/fp32）无关**：fp16 计算均发散，fp32 计算均超显存。故上述 fp16 权重与 fp32 权重各行结果一致。
 
 ### 已修复
 ncnn ROPE/RotaryEmbed 的 Vulkan 实现 —— 上游 [PR #6834](https://github.com/Tencent/ncnn/pull/6834) 修复全宽 `cos/sin` 缓存（2D / vision RoPE），以 patch 形式构建时自动应用。注意其未覆盖 `src/layer/x86/*`；对本工程输入 CPU 侧是 no-op（真正修复的是 Vulkan 缓存步长）。
