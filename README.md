@@ -1,6 +1,6 @@
 # LocateAnything-ncnn
 
-基于 [ncnn](https://github.com/Tencent/ncnn) 的 LocateAnything-3B（grounding VLM）推理实现。它是独立工程，仅从 `ncnn_llm` 拷入了该模型运行所需的最小代码集。
+基于 [`ncnn`](https://github.com/Tencent/ncnn) 的 LocateAnything-3B（grounding VLM）推理实现。它是独立工程，仅从 [`ncnn_llm`](https://github.com/futz12/ncnn_llm) 拷入了该模型运行所需的最小代码集。
 
 ## 特性
 - 支持动态输入推理（接近原始项目），拆分为 6 个子图：vision_embed / vision_encoder / vision_projector / text_embed / text_decoder(KV) / lm_head。
