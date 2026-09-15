@@ -714,20 +714,14 @@ std::vector<int> ncnn_llm_locateanything::mtp_window_decode(const std::vector<nc
                              ref_end_id_, null_id_, im_end_id_, none_id_, type);
 }
 
-// 把 KV 裁到前 rows 行（每层 k/v 各 channel 取前 rows*head_dim）。torch 每步 MTP/AR
-// forward 后都把 KV 截断到"真实生成 token 数"，丢弃 mask 占位产生的行，这里等价还原。
+// 把 KV 的逻辑长度裁到前 rows 行。ncnn x86 SDPA 的 cache 可能是 panel/interleaved
+// layout，不能按普通二维 Mat 逐行 memcpy；保留底层 buffer，只更新逻辑 h 即可丢弃尾部 token。
 static void trim_kv(KVCache& kv, int rows) {
     for (auto& pr : kv) {
-        if (pr.first.h > rows) {
-            ncnn::Mat k(pr.first.w, rows, pr.first.c);
-            ncnn::Mat v(pr.second.w, rows, pr.second.c);
-            for (int ic = 0; ic < pr.first.c; ic++) {
-                memcpy(k.channel(ic), pr.first.channel(ic), (size_t)rows * pr.first.w * sizeof(float));
-                memcpy(v.channel(ic), pr.second.channel(ic), (size_t)rows * pr.second.w * sizeof(float));
-            }
-            pr.first = k;
-            pr.second = v;
-        }
+        if (pr.first.h > rows)
+            pr.first.h = rows;
+        if (pr.second.h > rows)
+            pr.second.h = rows;
     }
 }
 
