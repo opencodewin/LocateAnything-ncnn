@@ -412,8 +412,8 @@ static ncnn::Mat la_canonical_kv(const ncnn::Mat& src, const char* tag) {
 }
 
 ncnn::Mat ncnn_llm_locateanything::run_text_embed(const std::vector<int>& ids) {
-    ncnn::Mat in((int)ids.size(), 1);
-    std::memcpy(in.data, ids.data(), ids.size() * sizeof(int));
+    // 零拷贝外部内存视图：extract 同步完成，ids 生命周期覆盖本次调用。
+    ncnn::Mat in((int)ids.size(), 1, (void*)ids.data(), 4, 1);
     ncnn::Mat out;
     ncnn::Extractor ex = net_text_embed_->create_extractor();
     ex.input("in0", in);
@@ -423,7 +423,7 @@ ncnn::Mat ncnn_llm_locateanything::run_text_embed(const std::vector<int>& ids) {
 
 ncnn::Mat ncnn_llm_locateanything::run_decoder(const ncnn::Mat& emb, const ncnn::Mat& cos,
                                                const ncnn::Mat& sin, const ncnn::Mat& mask,
-                                               KVCache& kv, bool is_prefill) {
+                                               KVCache& kv, bool is_prefill, bool want_out) {
     // 文本链只有一份 net：--vulkan 时是 Vulkan 版（prefill 与 decode 同走它），
     // 否则是 CPU 版。
     ncnn::Net* net = net_text_decoder_.get();
@@ -461,6 +461,9 @@ ncnn::Mat ncnn_llm_locateanything::run_decoder(const ncnn::Mat& emb, const ncnn:
             kv[i].second = ov_;
         }
     }
+    // 图在首次 KV extract 时已完整前向；want_out=false（prefill）时 out0 只被丢弃，
+    // 跳过 extract + 解包/摊平（[hidden,S] 整矩阵拷贝），省去多余的规范化。
+    if (!want_out) return ncnn::Mat();
     ex.extract("out0", out);
     return la_canonical_2d(out, hidden_, "text_decoder.out0");
 }
@@ -484,10 +487,10 @@ ncnn::Mat ncnn_llm_locateanything::run_lm_head(const ncnn::Mat& hidden) {
 // ============================================================================
 
 // ncnn Mat(hidden,K)：rows=位置，w=hidden。取第 i 位置单行成 [hidden,1]。
+// 零拷贝外部内存视图：run_lm_head 同步 extract，且 hidden 的生命周期覆盖该调用，
+// 因此无需 memcpy 复制一行。
 static ncnn::Mat row_of(const ncnn::Mat& hidden, int i, int hidden_dim) {
-    ncnn::Mat row(hidden_dim, 1);
-    memcpy(row.data, hidden.row(i), (size_t)hidden_dim * sizeof(float));
-    return row;
+    return ncnn::Mat(hidden_dim, 1, (void*)hidden.row(i), 4, 1);
 }
 
 // 构建 [past+K, K] 的 MTP 块掩码（w=keys, h=queries，0=可见, mask_fill_=屏蔽）。
@@ -1104,7 +1107,8 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
 
     KVCache kv;
     kv.reserve((size_t)layers_ * 2);
-    ncnn::Mat hidden = run_decoder(embed, cos, sin, mask, kv, true);  // Mat(hidden, S)
+    // prefill 只为填 KV cache；out0 后续不使用，跳过其规范化（见 run_decoder want_out）。
+    run_decoder(embed, cos, sin, mask, kv, true, false);
 
     // 6) MTP 并行窗口解码（+ AR 回退），对齐 torch generation_mode='hybrid'。
     //    ids 即 prompt token 流，函数内会追加生成 token；out_text 由回调逐 token 累积。

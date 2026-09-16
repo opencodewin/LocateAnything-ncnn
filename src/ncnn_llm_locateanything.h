@@ -80,7 +80,8 @@ private:
     void run_vision_features(const ncnn::Mat& bgr, ncnn::Mat& image_features);
     ncnn::Mat run_text_embed(const std::vector<int>& ids);
     ncnn::Mat run_decoder(const ncnn::Mat& emb, const ncnn::Mat& cos, const ncnn::Mat& sin,
-                          const ncnn::Mat& mask, KVCache& kv, bool is_prefill);
+                          const ncnn::Mat& mask, KVCache& kv, bool is_prefill,
+                          bool want_out = true);
     ncnn::Mat run_lm_head(const ncnn::Mat& hidden);
     bool load_pos_emb(const std::string& path);
     // 结构 token（<box>/</box>/<0>~<1000>/<ref>/...）的文本渲染；非结构 token 返回空串。
