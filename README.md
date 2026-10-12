@@ -30,9 +30,9 @@
 | CPU · AMD x86 (Linux) | AVX-512 开启/关闭 | 默认 fp32 数据路径；x86 SDPA 的 packed KV cache 经过修复后两种配置均正确 | ✅ 正确 |
 | Vulkan · NVIDIA | fp32 存储 | fp32 存储路径；MTP 与 `--no-mtp` 均已实测 | ✅ 正确 |
 | Vulkan · NVIDIA (5090) | `--bf16` / `--fp16` | 分别强制 BF16 / IEEE FP16 存储；有针对性修复覆盖 | 根因已修复；该卡待复测 |
-| Vulkan · NVIDIA (1080Ti) | `--fp16` | 强制 IEEE FP16 存储；不支持 BF16 时 `--bf16` 会明确报错 | 根因已修复；该卡待复测 |
+| Vulkan · NVIDIA (1080Ti) | `--fp16` | 强制 IEEE FP16 存储；不支持 BF16 时 `--bf16` 会明确报错 | ✅ 正确 |
 | Vulkan · Apple M1 Pro (MoltenVK) | fp32 存储 | 完整 `football.jpg` prompt 触发 `vkWaitForFences failed -4`；在 `3cfacf1` 上同样复现 | ⚠️ 长 prompt device lost |
-| Vulkan · Apple M1 Pro (MoltenVK) | `--fp16 --max-new-tokens 9` | IEEE FP16 MTP 修复 cache stride 后输出完整框 | ✅ 有框（MTP） |
+| Vulkan · Apple M1 Pro (MoltenVK) | `--fp16 --max-new-tokens 9` | IEEE FP16 MTP 修复 cache stride 后输出完整框 | ✅ 正确 |
 
 > `--fp16` / `--bf16` 分别强制选择对应的 Vulkan 激活存储，不自动回退到另一种存储；设备不支持请求的类型时会报错。两者同时指定也会提示冲突并拒绝启动。设备报告支持 BF16 storage 时会启用 `use_fp16_arithmetic` 选项，最终可用能力仍由 ncnn 按设备特性校验。5090 和 1080Ti 上此前观察到的问题已定位并修复，但当前没有这两张卡可供复测。
 > M1 Pro 上完整图片的 FP32 Vulkan 推理曾触发 MoltenVK `vkWaitForFences failed -4`，并在历史提交 `3cfacf1` 上复现；这是独立的 device-lost 故障，不能据此判断 FP32 数值正确性。FP16 MTP 的 KV 步长修复已在 M1 Pro 完整图片、greedy、9-token 测试中验证。
