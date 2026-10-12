@@ -120,4 +120,3 @@ set_target_properties(locate_main PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_B
 add_executable(bench_platform src/bench_platform.cpp)
 target_link_libraries(bench_platform PRIVATE locate_anything)
 set_target_properties(bench_platform PROPERTIES RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
-
