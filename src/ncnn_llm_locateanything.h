@@ -53,8 +53,9 @@ struct LocateGenerateConfig {
 class ncnn_llm_locateanything : public ncnn_llm_base {
 public:
     ncnn_llm_locateanything(const std::string& model_path, bool use_vulkan, int num_threads,
-                            int vulkan_device = 0, bool use_fp16 = false, bool weights_in_host = false,
-                            bool vision_use_vulkan = false);
+                            int vulkan_device = 0,
+                            VulkanStorageType storage_type = VulkanStorageType::FP32,
+                            bool weights_in_host = false, bool vision_use_vulkan = false);
 
     bool ok() const { return ok_; }
 

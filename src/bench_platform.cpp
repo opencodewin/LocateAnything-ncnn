@@ -9,12 +9,13 @@
 #include "utils/image_utils.h"
 #include "utf8_args.h"
 
-// 跨平台对比基准：同一输入分别在 CPU-fp32 / GPU-fp32 / GPU-fp16 下跑端到端推理，
+// 跨平台对比基准：同一输入分别在 CPU-fp32 / GPU-fp32 / GPU-低精度存储 下跑端到端推理，
 // 统计端到端耗时，并以 CPU-fp32 输出为参考衡量其它平台的文本一致性。
 //
 // 用法:
 //   bench_platform --image <img> [--model <dir>] [--prompt <q>] [--threads N]
 //                  [--vulkan-device <idx>] [--max-new-tokens N] [--iter N]
+//                  [--fp16|--bf16] 选择 GPU 低精度存储（默认 --fp16）
 //                  [--vision-vulkan] 视觉 3 子图也走 Vulkan（须 --vulkan 已开启，否则无效）
 //                  [--weights-in-host] 权重 offload 到系统内存（仅离散 GPU / 非 mac，缓解 fp32 超显存）
 //                  [--no-mtp]   纯逐 token AR（对比 MTP 窗口解码）
@@ -26,13 +27,7 @@ namespace {
 struct BenchConfig {
     const char* label;
     bool vulkan;
-    bool fp16;
-};
-
-const BenchConfig kConfigs[] = {
-    {"cpu-fp32", false, false},
-    {"gpu-fp32", true,  false},
-    {"gpu-fp16", true,  true },
+    VulkanStorageType storage_type;
 };
 
 // 归一化文本一致性（基于 Levenshtein 距离）：[0,1]，1 = 逐字符完全一致。
@@ -69,6 +64,8 @@ int main(int argc, char** argv) {
     int max_new = 512;
     int iters = 3;
     bool use_mtp = true;
+    bool use_fp16 = false;
+    bool use_bf16 = false;
     bool cpu_only = false;
     bool vision_vulkan = false;
     bool weights_in_host = false;
@@ -90,6 +87,10 @@ int main(int argc, char** argv) {
             if (max_new <= 0) max_new = 512;
         } else if (a == "--no-mtp") {
             use_mtp = false;
+        } else if (a == "--fp16") {
+            use_fp16 = true;
+        } else if (a == "--bf16") {
+            use_bf16 = true;
         } else if (a == "--vision-vulkan") {
             vision_vulkan = true;
         }
@@ -112,10 +113,22 @@ int main(int argc, char** argv) {
         fprintf(stderr,
             "Usage: %s --image <img> [--model <dir>] [--prompt <q>]\n"
             "       [--threads N] [--vulkan-device <idx>] [--max-new-tokens N] [--no-mtp] [--iter N]\n"
-            "       [--vision-vulkan] [--weights-in-host] [--save-dir <dir>]\n",
+            "       [--fp16|--bf16] [--vision-vulkan] [--weights-in-host] [--save-dir <dir>]\n",
             argv[0]);
         return 2;
     }
+    if (use_fp16 && use_bf16) {
+        fprintf(stderr, "ERROR: --fp16 and --bf16 are mutually exclusive; choose one storage type.\n");
+        return 2;
+    }
+    const VulkanStorageType reduced_storage = use_bf16 ? VulkanStorageType::BF16
+                                                       : VulkanStorageType::FP16;
+    const char* reduced_label = use_bf16 ? "gpu-bf16" : "gpu-fp16";
+    const BenchConfig configs[] = {
+        {"cpu-fp32", false, VulkanStorageType::FP32},
+        {"gpu-fp32", true, VulkanStorageType::FP32},
+        {reduced_label, true, reduced_storage},
+    };
 
     ncnn::Mat bgr = load_image_to_ncnn_mat(image_path);
     if (ncnn_mat_empty(bgr)) {
@@ -137,14 +150,14 @@ int main(int argc, char** argv) {
     std::string ref_text;
     bool have_ref = false;
 
-    for (const auto& c : kConfigs) {
+    for (const auto& c : configs) {
         if (cpu_only && c.vulkan) continue;   // --cpu-only：只跑 cpu-fp32，跳过两个 GPU 配置
         printf("--- %s ---\n", c.label);
         std::string out;
         std::vector<LocateBox> boxes;
         std::chrono::duration<double> elapsed(0);
         {
-            ncnn_llm_locateanything la(model_path, c.vulkan, threads, vulkan_device, c.fp16,
+            ncnn_llm_locateanything la(model_path, c.vulkan, threads, vulkan_device, c.storage_type,
                                         weights_in_host, c.vulkan && vision_vulkan);
             if (!la.ok()) {
                 fprintf(stderr, "  FAIL construct/load model\n");

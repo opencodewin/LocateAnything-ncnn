@@ -14,8 +14,8 @@
 //
 // 用法:
 //   locate_main --image <image> [--model <models-dir>] [--prompt <question>]
-//               [--vulkan] [--vulkan-device <idx>] [--fp16] [--weights-in-host]
-//               [--greedy] [--max-new-tokens N] [--threads N]
+//               [--vulkan] [--vulkan-device <idx>] [--fp16|--bf16] [--weights-in-host]
+//               [--greedy] [--no-mtp] [--max-new-tokens N] [--threads N]
 //               [--save <out.png>] [--no-draw]
 //   （--image 必填；--model 默认 models/locate-anything-fp16；
 //     --weights-in-host 仅在非 macOS 生效，见参数解析处）
@@ -32,7 +32,9 @@ int main(int argc, char** argv) {
     bool use_vulkan = false;
     bool vision_vulkan = false;
     bool greedy = false;
+    bool use_mtp = true;
     bool use_fp16 = false;
+    bool use_bf16 = false;
     bool weights_in_host = false;
     int vulkan_device = 0;
     int threads = 4;
@@ -47,11 +49,13 @@ int main(int argc, char** argv) {
         else if (arg == "--prompt" && i + 1 < args.size()) { prompt = args[++i]; prompt_set = true; }
         else if (arg == "--vulkan") use_vulkan = true;
         else if (arg == "--vision-vulkan") vision_vulkan = true;
+        else if (arg == "--no-mtp") use_mtp = false;
         else if (arg == "--vulkan-device" && i + 1 < args.size()) {
             vulkan_device = std::stoi(args[++i]);
             if (vulkan_device < 0) vulkan_device = 0;
         }
         else if (arg == "--fp16") use_fp16 = true;
+        else if (arg == "--bf16") use_bf16 = true;
 #if !defined(__APPLE__)
         // macOS 为统一内存架构，host 权重无显存收益，忽略该标志（离散 GPU 才生效）。
         else if (arg == "--weights-in-host") weights_in_host = true;
@@ -71,19 +75,28 @@ int main(int argc, char** argv) {
 
     if (image_path.empty()) {
         fprintf(stderr, "Usage: %s --image <image_path> [--model <model_path>] [--prompt <question>]\n"
-                        "       [--vulkan] [--vision-vulkan] [--vulkan-device <idx>] [--fp16] [--weights-in-host] [--threads N]\n"
+                        "       [--vulkan] [--vision-vulkan] [--vulkan-device <idx>] [--fp16|--bf16] [--weights-in-host] [--threads N]\n"
                         "       [--save <out.png>] [--no-draw]\n",
                 argv[0]);
         return 1;
     }
+    if (use_fp16 && use_bf16) {
+        fprintf(stderr, "ERROR: --fp16 and --bf16 are mutually exclusive; choose one storage type.\n");
+        return 1;
+    }
+    const VulkanStorageType storage_type = use_fp16 ? VulkanStorageType::FP16
+                                          : use_bf16 ? VulkanStorageType::BF16
+                                                     : VulkanStorageType::FP32;
 
-    printf("Loading LocateAnything model from %s (threads=%d, vulkan=%s%s%s, precision=%s)\n",
+    const char* storage_name = storage_type == VulkanStorageType::FP16 ? "fp16"
+                             : storage_type == VulkanStorageType::BF16 ? "bf16" : "fp32";
+    printf("Loading LocateAnything model from %s (threads=%d, vulkan=%s%s%s, storage=%s)\n",
            model_path.c_str(), threads, use_vulkan ? "on" : "off",
            use_vulkan ? (" device=" + std::to_string(vulkan_device)).c_str() : "",
            use_vulkan && weights_in_host ? ", weights=host(offload)" : "",
-           use_fp16 ? "fp16" : "fp32");
+           storage_name);
 
-    ncnn_llm_locateanything la(model_path, use_vulkan, threads, vulkan_device, use_fp16,
+    ncnn_llm_locateanything la(model_path, use_vulkan, threads, vulkan_device, storage_type,
                                weights_in_host, vision_vulkan);
     if (!la.ok()) {
         fprintf(stderr, "Failed to load LocateAnything model\n");
@@ -105,6 +118,7 @@ int main(int argc, char** argv) {
 
     LocateGenerateConfig cfg;   // 采样相关取默认值（temperature/top_p/top_k）
     cfg.max_new_tokens = max_new;
+    cfg.use_mtp = use_mtp;
     cfg.do_sample = !greedy;   // --greedy 关闭采样，确定性 argmax（用于与 torch 逐 token 对比定位）
     cfg.repetition_penalty = greedy ? 1.0f : 1.1f;   // greedy 时关掉 rep/采样，纯净 argmax
     // 逐 token 打印到 stderr，便于实时观察 decode 进度（stdout 块缓冲看不动）

@@ -4,9 +4,9 @@
 
 ## 特性
 - 支持动态输入推理（接近原始项目），拆分为 6 个子图：vision_embed / vision_encoder / vision_projector / text_embed / text_decoder(KV) / lm_head。
-- 支持 MTP 并行窗口解码 + 结构化坐标 token（`<box><x1><y1><x2><y2></box>`）；也支持纯逐 token AR 解码（`--no-mtp`，两者输出结果一致）。
+- 支持 MTP 并行窗口解码 + 结构化坐标 token（`<box><x1><y1><x2><y2></box>`）；也支持纯逐 token AR 解码（`--no-mtp`，预算充足时输出语义一致）。
 - 图像处理严格按照原始项目中的 `MAX_DIM=1024`：最大边超过 1024 时用 LANCZOS 预缩后，再做自适应 grid。
-- `--vulkan-device <idx>` 支持多 GPU 选卡；`--fp16` 启用 2 字节激活存储（bf16 优先 / fp16 回退），不是强制使用 fp16 算术。默认是 fp32 存储路径。`--weights-in-host`（仅离散 GPU / 非 mac）把模型权重 offload 到系统内存，缓解 fp32 显存压力。
+- `--vulkan` 启用 Vulkan，`--vulkan-device <idx>` 选择设备；`--fp16` 明确选择 IEEE FP16 激活存储，`--bf16` 明确选择 BF16 激活存储，不再按设备能力自动优先 BF16。默认是 FP32 存储；两个低精度参数互斥，且需要 `--vulkan`。这些选项控制运行时激活存储，与 `--model` 指向的模型权重文件格式相互独立。`--weights-in-host`（仅离散 GPU / 非 mac）把模型权重 offload 到系统内存，缓解 fp32 显存压力。
 
 ### 精度和 CPU 路径的说明
 
@@ -17,7 +17,7 @@
 - GEMM、SDPA、量化和卷积等算子可能分别选择不同的实现，不能只根据“CPU”或“AVX”推断统一的计算数据类型；
 - 本项目默认 CPU 推理关闭 2 字节存储，因此本次 CPU 对照测试使用的是 fp32 数据路径，但这不等于所有底层指令都是 fp32 标量运算。
 
-因此，README 中将“存储类型”“算子输入/输出类型”“累加类型”和“SIMD 指令集”分开描述。`--fp16` 在本项目中主要控制 Vulkan 的 2 字节激活存储；它不应被理解为“整条推理链都改成 fp16 算术”。
+因此，README 中将“存储类型”“算子输入/输出类型”“累加类型”和“SIMD 指令集”分开描述。`--fp16` 和 `--bf16` 只选择 Vulkan 激活存储类型，不代表整条推理链都使用相同算术精度。
 
 ## 已知问题
 
@@ -29,15 +29,21 @@
 | CPU · Intel x86 (Windows) | 默认 CPU 路径 | 默认 fp32 数据路径；实际使用 SSE/AVX 等编译和运行时分派 | ✅ 正确 |
 | CPU · AMD x86 (Linux) | AVX-512 开启/关闭 | 默认 fp32 数据路径；x86 SDPA 的 packed KV cache 经过修复后两种配置均正确 | ✅ 正确 |
 | Vulkan · NVIDIA | fp32 存储 | fp32 存储路径；MTP 与 `--no-mtp` 均已实测 | ✅ 正确 |
-| Vulkan · NVIDIA (5090) | `--fp16` | 使用 bf16 存储时正确 ✅；使用 fp16 存储时发散 ❌ | ⚠️ 取决于实际存储类型 |
-| Vulkan · NVIDIA (1080Ti) | `--fp16` | 无 bf16 存储，回退到 fp16 存储 | ❌ 发散，出现 `<ref>!!!…` |
-| Vulkan · Apple M1 Pro (MoltenVK) | `--fp16` | 回退到 fp16 存储，无 bf16 存储 | ❌ 发散 |
+| Vulkan · NVIDIA (5090) | `--bf16` / `--fp16` | 分别强制 BF16 / IEEE FP16 存储；有针对性修复覆盖 | 根因已修复；该卡待复测 |
+| Vulkan · NVIDIA (1080Ti) | `--fp16` | 强制 IEEE FP16 存储；不支持 BF16 时 `--bf16` 会明确报错 | 根因已修复；该卡待复测 |
+| Vulkan · Apple M1 Pro (MoltenVK) | fp32 存储 | 完整 `football.jpg` prompt 触发 `vkWaitForFences failed -4`；在 `3cfacf1` 上同样复现 | ⚠️ 长 prompt device lost |
+| Vulkan · Apple M1 Pro (MoltenVK) | `--fp16 --max-new-tokens 9` | IEEE FP16 MTP 修复 cache stride 后输出完整框 | ✅ 有框（MTP） |
 
-> `--fp16` 的语义：在本项目中主要启用 2 字节激活存储，Vulkan 优先选择 bf16；设备不支持 bf16 时回退到 fp16。`use_fp16_arithmetic` 已关闭，因此不能把该选项理解成“强制整条推理链使用 fp16 算术”。
-> 当前实测表明，Vulkan 的 fp32 存储路径正确；2 字节存储是否正确取决于实际使用的类型。bf16 保留与 fp32 相同的指数宽度，在 5090 上正确；fp16 的指数范围较小，在 SDPA softmax 和长序列累加中发散。没有 bf16 存储能力的设备应使用默认 fp32 存储。
+> `--fp16` / `--bf16` 分别强制选择对应的 Vulkan 激活存储，不自动回退到另一种存储；设备不支持请求的类型时会报错。两者同时指定也会提示冲突并拒绝启动。设备报告支持 BF16 storage 时会启用 `use_fp16_arithmetic` 选项，最终可用能力仍由 ncnn 按设备特性校验。5090 和 1080Ti 上此前观察到的问题已定位并修复，但当前没有这两张卡可供复测。
+> M1 Pro 上完整图片的 FP32 Vulkan 推理曾触发 MoltenVK `vkWaitForFences failed -4`，并在历史提交 `3cfacf1` 上复现；这是独立的 device-lost 故障，不能据此判断 FP32 数值正确性。FP16 MTP 的 KV 步长修复已在 M1 Pro 完整图片、greedy、9-token 测试中验证。
 
-### 已修复
-ncnn ROPE/RotaryEmbed 的 Vulkan 实现 —— 上游 [PR #6834](https://github.com/Tencent/ncnn/pull/6834) 修复全宽 `cos/sin` 缓存（2D / vision RoPE），以 patch 形式构建时自动应用。注意其未覆盖 `src/layer/x86/*`；对本工程输入 CPU 侧是 no-op（真正修复的是 Vulkan 缓存步长）。
+### Vulkan RMSNorm 的 FP16 溢出
+
+Vulkan RMSNorm 的旧实现先在输入存储类型中计算平方，再把平方值交给归约。IEEE FP16 最大有限值为 65504，因此当输入绝对值超过约 256 时，平方可能溢出为无穷大；归约得到无效的均方值后，归一化系数可能变为零，表现为 decoder 某些输出行全零、后续 logits 分叉。这个问题是 RMSNorm 的 FP16 中间值溢出，不是单纯由 SDPA softmax 或长序列累加造成。
+
+项目在 [0001-vulkan-rmsnorm-fp16-overflow.patch](patches/0001-vulkan-rmsnorm-fp16-overflow.patch) 中为 ncnn Vulkan RMSNorm 增加融合归约：直接在 FP32 累加器中计算并累加平方，避免将 `x*x` 写回 FP16 张量，也省去平方临时张量；pack1 和 pack4 路径都包含在补丁中。该补丁由项目 CMake 在配置时自动应用。它修复的是 RMSNorm 的中间值溢出，不意味着所有设备、所有 FP16 算子都已在每种配置上完成实机验证。
+
+另一个独立问题是 MTP 窗口结束后 Vulkan KV cache 仅缩短逻辑长度、仍保留旧 `cstep`，后续 cache 增长会破坏历史 KV。LocateAnything 只在 Vulkan 提取出的标准 pack1 cache 上复制有效前缀并重建精确长度；CPU/x86 的 packed cache 仍只更新逻辑长度，以免破坏其物理布局。
 
 ### AMD CPU (x86, Linux) 的 KV cache 修复
 
@@ -53,8 +59,8 @@ ncnn ROPE/RotaryEmbed 的 Vulkan 实现 —— 上游 [PR #6834](https://github.
 
 ## 目录结构
 ```
-3rdparty/ncnn   # submodule：ncnn 源码，构建时自动应用 patches/
-patches/        # 按前缀数字排序，逐个 git apply（幂等，已应用会跳过）
+3rdparty/ncnn   # submodule：ncnn 源码，配置构建时自动应用 patches/
+patches/        # 项目维护的 ncnn 补丁；按前缀数字排序并幂等应用
 src/            # 运行时 + tokenizer + image_utils + json
 models/         # 外部模型目录，通过 --model 引用，不随工程提交
 ```
@@ -71,14 +77,18 @@ cmake -G Ninja -B build -S . -DCMAKE_BUILD_TYPE=Release   # 需 Git 以自动应
 cmake --build build
 ```
 默认启用 Vulkan，`-DLOCATE_NCNN_VULKAN=OFF` 关闭。
+macOS 构建默认关闭 NCNN_SIMPLEVK，以便通过系统 Vulkan loader（通常由 MoltenVK 提供）加载 Vulkan；也可显式设置 `-DNCNN_SIMPLEVK=OFF`：
+```bash
+cmake -G Ninja -B build -S . -DCMAKE_BUILD_TYPE=Release -DNCNN_SIMPLEVK=OFF
+```
 
 ## 运行
 ```bash
-./build/locate_main --model <fp32|fp16 模型目录> --image <img> --prompt <query> [选项]
+./build/locate_main --model <模型目录> --image <img> --prompt <query> [选项]
 ```
-- `--vulkan`、`--vulkan-device <idx>`：启用 GPU 与多卡选卡（越界回退 0）。
-- `--vision-vulkan`：让视觉 3 子图（vision_embed / vision_encoder / vision_projector）也走 Vulkan；默认随 `--vulkan` 一致。⚠️ 须 `--vulkan` 已开启，否则无效（Vulkan 设备未初始化，视觉仍 CPU）。当前 MoltenVK 上 6 张子图同载 Vulkan 会 `VK_ERROR_DEVICE_LOST`，故 Apple 平台暂不可用，仅作开关预留。
-- `--fp16`：启用 2 字节激活存储（bf16 优先，设备无 bf16 时回退 fp16），**同时作用于 Vulkan 文本链与视觉链**（二者一致）；本项目关闭 fp16 arithmetic。默认使用 fp32 存储路径。见「已知问题 / Vulkan 2 字节存储问题」。
+- `--vulkan`：启用 Vulkan；`--vulkan-device <idx>`：选择 GPU（索引越界时回退到 0）。
+- `--vision-vulkan`：额外让视觉 3 子图（vision_embed / vision_encoder / vision_projector）走 Vulkan。默认只有文本链走 Vulkan、视觉链仍走 CPU；该选项需要 `--vulkan`。当前 M1 Pro/MoltenVK 上同时将六个子图放在 Vulkan 曾触发 `VK_ERROR_DEVICE_LOST`，视觉 Vulkan 路径应视作未验证。
+- `--fp16`：明确启用 IEEE FP16 激活存储；`--bf16`：明确启用 BF16 激活存储。两个参数互斥，必须配合 `--vulkan`，且所选类型必须被 GPU 支持。所选存储类型作用于 Vulkan 子图；默认只有文本子图走 Vulkan，若同时启用 `--vision-vulkan`，视觉子图也使用所选存储类型。默认使用 FP32 存储路径。见「已知问题 / Vulkan 2 字节存储问题」。
 - `--threads N`、`--greedy`、`--max-new-tokens N`。
 - `--weights-in-host`（仅离散 GPU）：权重 offload 到系统内存，缓解设备显存不足。
 - `--save <out.png>`：画框保存（默认 `<image>_locate.png`）；`--no-draw` 关闭。
@@ -86,25 +96,26 @@ cmake --build build
 输出除结构化坐标 token 外，会逐框打印归一化/像素坐标；像素 = 归一化 × 原图宽高（`src/utils/draw_utils.h`）。
 
 ## 平台测试
-`bench_platform` 对同一输入按 cpu-fp32 → gpu-fp32 → gpu-fp16 顺序运行，统计各平台端到端耗时，并以 cpu-fp32 输出为参考衡量文本一致性（归一化 Levenshtein，1=完全一致）。greedy 确定性解码；每平台 warmup 1 次后测 N 次。
+`bench_platform` 对同一输入按 cpu-fp32 → gpu-fp32 → gpu-fp16（默认）顺序运行，也可通过 `--bf16` 将最后一项切换为 gpu-bf16；统计各平台端到端耗时，并以 cpu-fp32 输出为参考衡量文本一致性（归一化 Levenshtein，1=完全一致）。采用确定性 greedy 解码；每平台 warmup 1 次后测 N 次。
 
 ```bash
 cmake --build build --target bench_platform
-./build/bench_platform --image ../datas/football.jpg --prompt human --max-new-tokens 20 --iter 1  # 快速验证
-./build/bench_platform --image ../datas/football.jpg --prompt human --iter 3                     # 正式统计
+./build/bench_platform --image datas/football.jpg --prompt human --max-new-tokens 20 --iter 1  # 快速验证
+./build/bench_platform --image datas/football.jpg --prompt human --iter 3                     # 正式统计
 ```
-可选：`--threads N`、`--max-new-tokens N`、`--vulkan-device <idx>`、`--no-mtp`（纯 AR）、`--cpu-only`（跳过已知不可用的 Vulkan）、`--vision-vulkan`（视觉 3 子图也走 Vulkan，须 `--vulkan` 已开启、否则对各 GPU 配置无效）、`--weights-in-host`（仅离散 GPU / 非 mac，权重 offload 到系统内存以跑通 Vulkan fp32）、`--save-dir <dir>`（每配置存一张带框图）。
+可选：`--threads N`、`--max-new-tokens N`、`--vulkan-device <idx>`、`--fp16` / `--bf16`（选择 GPU 低精度存储；默认 fp16，不能同时指定）、`--no-mtp`（纯 AR）、`--cpu-only`（跳过 Vulkan）、`--vision-vulkan`（视觉 3 子图也走 Vulkan）、`--weights-in-host`（仅离散 GPU / 非 mac，权重 offload 到系统内存）、`--save-dir <dir>`（每配置存一张带框图）。
 
 **注意**：
 - 一致性只衡量平台输出是否彼此相同，不代表检出全部目标（`datas/football.jpg` 有 **8 人**）；检测质量需另用标注数据评估。
-- MTP 与 AR 结果一致；框数差异来自 token 预算截断（一个框恰 6 token，`max_new=20` 仅够 3 框）。跨平台/跨模式对比时 `--max-new-tokens` 须**一致且给足**。
+- `--max-new-tokens` 是生成 token 的预算上限，不保证一定用满。MTP 按完整结构组提交，不能跨预算提交半组：`<ref>human</ref>` 占 3 token，后续完整 `<box><x1><y1><x2><y2></box>` 占 6 token；在当前 `football.jpg` 的 greedy 测试中，`max-new-tokens=9` 可生成一个完整框，设为 4 时只提交完整 ref，剩余 1 个 token 不会用于半个 box。`--no-mtp` 的 AR 则逐 token 生成，预算不足时可能截断在结构组中间。比较 MTP 与 AR 或不同平台时，使用相同且足以容纳所需结构组的预算；对一个 ref 加一个框至少设为 9。
+- CPU 上 MTP 与 AR 在 `football.jpg`、`max-new-tokens=9` 下均输出一个目标框，坐标相差最多 1 个量化单位；Vulkan IEEE FP16 的 MTP 经 KV stride 修复后也输出一个完整框。
 
 ## Vulkan 2 字节存储问题（定位小结）
-早期测试把问题归因于 Vulkan fp16 arithmetic；后续关闭 fp16 arithmetic，并分别比较 fp32、bf16 和 fp16 存储后，确认主要原因是激活存储类型的指数范围，而不是单纯的算术开关。定位过程中排除了：
+早期测试曾怀疑 Vulkan FP16 指数范围、arithmetic 开关或 SDPA softmax；逐层比较 decoder 输出后，确认某些全零行来自 RMSNorm 在 FP16 存储类型中的平方溢出。定位过程中还检查了：
 
 - Flash Attention：禁用后结果没有改变；
 - RoPE：上游 PR #6834 已应用，但 2 字节存储问题仍存在；
 - 单独的文本 decoder：视觉前向在相同 2 字节存储配置下也会受到影响；
 - 权重存储：fp16/fp32 权重的差异不是主要原因，问题出在激活存储类型。
 
-**结论**：`src/ncnn_llm_base.h` 中已关闭 `use_fp16_arithmetic`；`--fp16` 只负责选择 2 字节激活存储，bf16 优先、无 bf16 时回退 fp16。fp32 Vulkan 路径已验证正确；5090 上 bf16 存储正确而 fp16 存储发散，原因是 bf16 保留与 fp32 相同的指数宽度，而 fp16 的指数范围较小。1080Ti 和 M1 Pro 没有可用的 bf16 存储能力，应使用默认 fp32 存储。
+**结果摘要**：`--fp16` 与 `--bf16` 分别选择 IEEE FP16 / BF16 激活存储；设备报告支持 BF16 storage 时设置 `use_fp16_arithmetic=true`，ncnn 随后仍会按设备能力与存储选项校验。Vulkan RMSNorm 的 IEEE FP16 平方溢出由上述 ncnn 补丁修复；MTP KV stride 问题由 LocateAnything 的 Vulkan 专用精确长度复制修复。修复后 M1 Pro 完整图片、greedy、9-token FP16 MTP 输出完整框；第二窗口 cache 前缀 K/V 对照差异为零。5090 的 BF16/FP16 与 1080Ti 的 FP16 路径属于修复覆盖范围，但尚待对应硬件复测。FP32 Vulkan 的 M1 Pro 长 prompt device-lost 仍未解决；macOS 默认关闭 SimpleVK 以使用系统 Vulkan loader。

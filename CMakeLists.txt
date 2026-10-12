@@ -70,6 +70,11 @@ set(NCNN_BUILD_BENCHMARK OFF CACHE BOOL "" FORCE)
 set(NCNN_BUILD_TESTS     OFF CACHE BOOL "" FORCE)
 set(NCNN_PYTHON          OFF CACHE BOOL "" FORCE)
 set(NCNN_VULKAN          ${LOCATE_NCNN_VULKAN} CACHE BOOL "" FORCE)
+# On Apple, use the system Vulkan loader (typically MoltenVK) instead of
+# ncnn's minimal dynamic loader, which may not find Homebrew's libvulkan.
+if(APPLE AND NOT DEFINED NCNN_SIMPLEVK)
+    set(NCNN_SIMPLEVK OFF CACHE BOOL "Use ncnn's minimal Vulkan loader")
+endif()
 if(LOCATE_STATIC_NCNN)
     set(NCNN_SHARED OFF CACHE BOOL "" FORCE)
 else()

@@ -3,7 +3,6 @@
 #include <cmath>
 #include <cstdio>
 #include <cstring>
-#include <limits>
 #include <random>
 #include <string>
 #include <utility>
@@ -17,6 +16,12 @@
 #endif
 
 using KVCache = std::vector<std::pair<ncnn::Mat, ncnn::Mat>>;
+
+enum class VulkanStorageType {
+    FP32,
+    FP16,
+    BF16
+};
 
 inline ncnn::Mat mat_from_int_vector(const std::vector<int>& vec) {
     ncnn::Mat m(static_cast<int>(vec.size()), 1, 1);
@@ -113,18 +118,22 @@ protected:
     bool use_vulkan_ = false;
     int num_threads_ = 4;
     int vulkan_device_ = 0;   // 使用的 Vulkan 设备序号（多 GPU 时可指定）
-    bool use_fp16_ = false;   // --fp16：Vulkan 走 2 字节存储（bf16 优先 / fp16 兜底），计算恒 fp32
+    VulkanStorageType storage_type_ = VulkanStorageType::FP32;
     bool weights_in_host_ = false; // 权重驻留宿主内存（offload 显存），Vulkan 专用
     bool ok_ = true;
     std::mt19937 rng_{std::random_device{}()};
 
     ncnn_llm_base(bool use_vulkan = false, int num_threads = 4,
-                  int vulkan_device = 0, bool use_fp16 = false,
+                  int vulkan_device = 0, VulkanStorageType storage_type = VulkanStorageType::FP32,
                   bool weights_in_host = false)
         : use_vulkan_(use_vulkan), num_threads_(num_threads),
-          vulkan_device_(vulkan_device), use_fp16_(use_fp16),
+          vulkan_device_(vulkan_device), storage_type_(storage_type),
           weights_in_host_(weights_in_host) {
 #if NCNN_VULKAN
+        if (storage_type_ != VulkanStorageType::FP32 && !use_vulkan_) {
+            fprintf(stderr, "[ncnn] ERROR --fp16/--bf16 require --vulkan\n");
+            ok_ = false;
+        }
         if (use_vulkan) {
             ncnn::create_gpu_instance();
             int cnt = ncnn::get_gpu_count();
@@ -139,9 +148,19 @@ protected:
                         vulkan_device_);
                 vulkan_device_ = 0;
             }
-            // 见 create_option()：fp16 算术已按 zimage 方案关闭，计算恒为 fp32；
-            // --fp16 仅用于 2 字节存储。此时无需再要求设备支持 fp16 算术。
-            (void)use_fp16_;
+            const ncnn::GpuInfo& info = ncnn::get_gpu_info(vulkan_device_);
+            if (storage_type_ == VulkanStorageType::FP16 && !info.support_fp16_storage()) {
+                fprintf(stderr, "[ncnn] ERROR selected Vulkan device does not support FP16 storage\n");
+                ok_ = false;
+            } else if (storage_type_ == VulkanStorageType::BF16 && !info.support_bf16_storage()) {
+                fprintf(stderr, "[ncnn] ERROR selected Vulkan device does not support BF16 storage\n");
+                ok_ = false;
+            }
+        }
+#else
+        if (storage_type_ != VulkanStorageType::FP32) {
+            fprintf(stderr, "[ncnn] ERROR --fp16/--bf16 require a Vulkan-enabled build\n");
+            ok_ = false;
         }
 #endif
     }
@@ -158,39 +177,27 @@ protected:
         ncnn::Option opt;
         opt.num_threads = num_threads_;
         opt.use_vulkan_compute = use_vulkan_;
-        // NCNN defaults all fp16/bf16 options to true, so the fp32 baseline must
-        // explicitly clear them before enabling the requested Vulkan precision.
+        // Clear both storage formats first, then enable only the explicitly
+        // requested Vulkan storage type.
         opt.use_fp16_packed = false;
         opt.use_fp16_storage = false;
-        opt.use_fp16_arithmetic = false;
         opt.use_bf16_packed = false;
         opt.use_bf16_storage = false;
-        // --fp16 采用 zimage-ncnn-vulkan 的方案：Vulkan 下 fp16 *算术*在注意力
-        // softmax / 长序列累加上会塌缩或溢出而发散（各子图均如此），故一律关闭
-        // fp16 算术，计算恒为 fp32；2 字节带宽目标改由 bf16/fallback fp16 存储
-        // 承担（bf16 保留 fp32 的 8 位指数，SDPA 的 softmax 动态范围不受损）。
-        if (use_fp16_) {
 #if NCNN_VULKAN
-            if (use_vulkan_) {
-                const ncnn::GpuInfo& info = ncnn::get_gpu_info(vulkan_device_);
-                if (info.support_bf16_storage()) {
-                    // 首选 bf16 存储（2 字节、指数范围同 fp32）。
-                    opt.use_bf16_packed = true;
-                    opt.use_bf16_storage = true;
-                } else {
-                    // 设备无 bf16 存储（如 NVIDIA Pascal 1080Ti）时回退 fp16 存储：
-                    // 仅省带宽/显存，算术仍是 fp32，不引入 fp16 精度问题。
-                    opt.use_fp16_packed = true;
-                    opt.use_fp16_storage = true;
-                }
+        if (use_vulkan_) {
+            const ncnn::GpuInfo& info = ncnn::get_gpu_info(vulkan_device_);
+            if (info.support_bf16_storage())
+                opt.use_fp16_arithmetic = true;
+
+            if (storage_type_ == VulkanStorageType::FP16) {
+                opt.use_fp16_packed = true;
+                opt.use_fp16_storage = true;
+            } else if (storage_type_ == VulkanStorageType::BF16) {
+                opt.use_bf16_packed = true;
+                opt.use_bf16_storage = true;
             }
-#else
-            // 非 Vulkan 构建：CPU 无 fp16 硬件，ncnn 恒为 fp32 计算，此开关无实际
-            // 效果，仅保留标志位语义。
-            opt.use_bf16_packed = true;
-            opt.use_bf16_storage = true;
-#endif
         }
+#endif
 #if NCNN_VULKAN
         if (use_vulkan_) {
             // 绑定到指定 Vulkan 设备（多 GPU 时由 --vulkan-device 决定）。

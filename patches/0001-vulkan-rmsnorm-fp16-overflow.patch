@@ -1,0 +1,412 @@
+diff --git a/cmake/ncnn_add_layer.cmake b/cmake/ncnn_add_layer.cmake
+index 41e5af39..15696a54 100644
+--- a/cmake/ncnn_add_layer.cmake
++++ b/cmake/ncnn_add_layer.cmake
+@@ -130,8 +130,8 @@ macro(ncnn_add_layer class)
+         set(layer_declaration "${layer_declaration}#include \"layer/vulkan/${name}_vulkan.h\"\n")
+         set(layer_declaration "${layer_declaration}namespace ncnn { DEFINE_LAYER_CREATOR(${class}_vulkan) }\n")
+
+-        file(GLOB NCNN_SHADER_SRCS "layer/vulkan/shader/${name}.comp")
+-        file(GLOB NCNN_SHADER_SUBSRCS "layer/vulkan/shader/${name}_*.comp")
++        file(GLOB NCNN_SHADER_SRCS CONFIGURE_DEPENDS "layer/vulkan/shader/${name}.comp")
++        file(GLOB NCNN_SHADER_SUBSRCS CONFIGURE_DEPENDS "layer/vulkan/shader/${name}_*.comp")
+         list(APPEND NCNN_SHADER_SRCS ${NCNN_SHADER_SUBSRCS})
+         if(NOT NCNN_BATCH AND name STREQUAL "reshape")
+             list(REMOVE_ITEM NCNN_SHADER_SRCS
+diff --git a/src/layer/vulkan/rmsnorm_vulkan.cpp b/src/layer/vulkan/rmsnorm_vulkan.cpp
+index 6a9b93cc..a937335e 100644
+--- a/src/layer/vulkan/rmsnorm_vulkan.cpp
++++ b/src/layer/vulkan/rmsnorm_vulkan.cpp
+@@ -12,8 +12,7 @@ RMSNorm_vulkan::RMSNorm_vulkan()
+     support_vulkan_packing = true;
+
+     // pack1
+-    pipeline_rmsnorm_square = 0;
+-    pipeline_rmsnorm_reduce_sum4_fp16_to_fp32 = 0;
++    pipeline_rmsnorm_reduce_sum4 = 0;
+     pipeline_rmsnorm_reduce_sum4_fp32[0] = 0;
+     pipeline_rmsnorm_reduce_sum4_fp32[1] = 0;
+     pipeline_rmsnorm_reduce_mean = 0;
+@@ -21,8 +20,7 @@ RMSNorm_vulkan::RMSNorm_vulkan()
+     pipeline_rmsnorm_norm = 0;
+
+     // pack4
+-    pipeline_rmsnorm_square_pack4 = 0;
+-    pipeline_rmsnorm_reduce_sum4_fp16_to_fp32_pack4 = 0;
++    pipeline_rmsnorm_reduce_sum4_pack4 = 0;
+     pipeline_rmsnorm_reduce_sum4_fp32_pack4[0] = 0;
+     pipeline_rmsnorm_reduce_sum4_fp32_pack4[1] = 0;
+     pipeline_rmsnorm_reduce_mean_pack4 = 0;
+@@ -32,23 +30,17 @@ RMSNorm_vulkan::RMSNorm_vulkan()
+
+ int RMSNorm_vulkan::create_pipeline(const Option& opt)
+ {
+-    // Reuse the LN reduce_sum4 / reduce_mean size and local workgroup configuration [from LN code].
+-    // square: only compute x^2; coeffs: a = 1 / sqrt(rms + eps); norm: v = v * a; (if affine: v *= gamma)
++    // Reuse the LN reduce_sum4 / reduce_mean configurations; fuse squaring into the first reduction.
+     {
+-        pipeline_rmsnorm_square = new Pipeline(vkdev);
+-        pipeline_rmsnorm_square->set_optimal_local_size_xyz(8, 8, 1);
+-        pipeline_rmsnorm_square->create(LayerShaderType::rmsnorm_square, opt, std::vector<vk_specialization_type>());
++        pipeline_rmsnorm_reduce_sum4 = new Pipeline(vkdev);
++        pipeline_rmsnorm_reduce_sum4->set_optimal_local_size_xyz(16, 4, 1);
++        pipeline_rmsnorm_reduce_sum4->create(LayerShaderType::rmsnorm_reduce_sum4, opt, std::vector<vk_specialization_type>());
+
+-        pipeline_rmsnorm_square_pack4 = new Pipeline(vkdev);
+-        pipeline_rmsnorm_square_pack4->set_optimal_local_size_xyz(8, 8, 1);
+-        pipeline_rmsnorm_square_pack4->create(LayerShaderType::rmsnorm_square_pack4, opt, std::vector<vk_specialization_type>());
++        pipeline_rmsnorm_reduce_sum4_pack4 = new Pipeline(vkdev);
++        pipeline_rmsnorm_reduce_sum4_pack4->set_optimal_local_size_xyz(16, 4, 1);
++        pipeline_rmsnorm_reduce_sum4_pack4->create(LayerShaderType::rmsnorm_reduce_sum4_pack4, opt, std::vector<vk_specialization_type>());
+     }
+     {
+-        // Same as LN's reduce_sum4 (first pass fp16->fp32, then iterative fp32 passes alternating between two pipelines) and reduce_mean (see LN).
+-        pipeline_rmsnorm_reduce_sum4_fp16_to_fp32 = new Pipeline(vkdev);
+-        pipeline_rmsnorm_reduce_sum4_fp16_to_fp32->set_optimal_local_size_xyz(16, 4, 1);
+-        pipeline_rmsnorm_reduce_sum4_fp16_to_fp32->create(LayerShaderType::layernorm_reduce_sum4_fp16_to_fp32, opt, std::vector<vk_specialization_type>());
+-
+         pipeline_rmsnorm_reduce_sum4_fp32[0] = new Pipeline(vkdev);
+         pipeline_rmsnorm_reduce_sum4_fp32[0]->set_optimal_local_size_xyz(8, 8, 1);
+         pipeline_rmsnorm_reduce_sum4_fp32[0]->create(LayerShaderType::layernorm_reduce_sum4_fp32, opt, std::vector<vk_specialization_type>());
+@@ -56,10 +48,6 @@ int RMSNorm_vulkan::create_pipeline(const Option& opt)
+         pipeline_rmsnorm_reduce_sum4_fp32[1]->set_optimal_local_size_xyz(8, 8, 1);
+         pipeline_rmsnorm_reduce_sum4_fp32[1]->create(LayerShaderType::layernorm_reduce_sum4_fp32, opt, std::vector<vk_specialization_type>());
+
+-        pipeline_rmsnorm_reduce_sum4_fp16_to_fp32_pack4 = new Pipeline(vkdev);
+-        pipeline_rmsnorm_reduce_sum4_fp16_to_fp32_pack4->set_optimal_local_size_xyz(16, 4, 1);
+-        pipeline_rmsnorm_reduce_sum4_fp16_to_fp32_pack4->create(LayerShaderType::layernorm_reduce_sum4_fp16_to_fp32_pack4, opt, std::vector<vk_specialization_type>());
+-
+         pipeline_rmsnorm_reduce_sum4_fp32_pack4[0] = new Pipeline(vkdev);
+         pipeline_rmsnorm_reduce_sum4_fp32_pack4[0]->set_optimal_local_size_xyz(8, 8, 1);
+         pipeline_rmsnorm_reduce_sum4_fp32_pack4[0]->create(LayerShaderType::layernorm_reduce_sum4_fp32_pack4, opt, std::vector<vk_specialization_type>());
+@@ -108,15 +96,13 @@ int RMSNorm_vulkan::create_pipeline(const Option& opt)
+ int RMSNorm_vulkan::destroy_pipeline(const Option&)
+ {
+     // pack1
+-    delete pipeline_rmsnorm_square;
+-    delete pipeline_rmsnorm_reduce_sum4_fp16_to_fp32;
++    delete pipeline_rmsnorm_reduce_sum4;
+     delete pipeline_rmsnorm_reduce_sum4_fp32[0];
+     delete pipeline_rmsnorm_reduce_sum4_fp32[1];
+     delete pipeline_rmsnorm_reduce_mean;
+     delete pipeline_rmsnorm_coeffs;
+     delete pipeline_rmsnorm_norm;
+-    pipeline_rmsnorm_square = 0;
+-    pipeline_rmsnorm_reduce_sum4_fp16_to_fp32 = 0;
++    pipeline_rmsnorm_reduce_sum4 = 0;
+     pipeline_rmsnorm_reduce_sum4_fp32[0] = 0;
+     pipeline_rmsnorm_reduce_sum4_fp32[1] = 0;
+     pipeline_rmsnorm_reduce_mean = 0;
+@@ -124,15 +110,13 @@ int RMSNorm_vulkan::destroy_pipeline(const Option&)
+     pipeline_rmsnorm_norm = 0;
+
+     // pack4
+-    delete pipeline_rmsnorm_square_pack4;
+-    delete pipeline_rmsnorm_reduce_sum4_fp16_to_fp32_pack4;
++    delete pipeline_rmsnorm_reduce_sum4_pack4;
+     delete pipeline_rmsnorm_reduce_sum4_fp32_pack4[0];
+     delete pipeline_rmsnorm_reduce_sum4_fp32_pack4[1];
+     delete pipeline_rmsnorm_reduce_mean_pack4;
+     delete pipeline_rmsnorm_coeffs_pack4;
+     delete pipeline_rmsnorm_norm_pack4;
+-    pipeline_rmsnorm_square_pack4 = 0;
+-    pipeline_rmsnorm_reduce_sum4_fp16_to_fp32_pack4 = 0;
++    pipeline_rmsnorm_reduce_sum4_pack4 = 0;
+     pipeline_rmsnorm_reduce_sum4_fp32_pack4[0] = 0;
+     pipeline_rmsnorm_reduce_sum4_fp32_pack4[1] = 0;
+     pipeline_rmsnorm_reduce_mean_pack4 = 0;
+@@ -156,7 +140,6 @@ int RMSNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, cons
+     const int w = dims == 1 ? bottom_top_blob.w * bottom_top_blob.elempack : bottom_top_blob.w;
+     const int h = bottom_top_blob.h * bottom_top_blob.d;
+     const int channels = bottom_top_blob.c;
+-    const size_t elemsize = dims == 1 ? bottom_top_blob.elemsize * bottom_top_blob.elempack : bottom_top_blob.elemsize;
+     const int elempack = dims == 1 ? 1 : bottom_top_blob.elempack;
+     const size_t cstep = dims == 1 ? bottom_top_blob.cstep * bottom_top_blob.elempack : bottom_top_blob.cstep;
+
+@@ -196,25 +179,7 @@ int RMSNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, cons
+     }
+     int num_groups_total = num_groups_per_channel * channels;
+
+-    // 1) x -> x^2
+-    VkMat square_workspace(w, h, channels, elemsize, elempack, opt.workspace_vkallocator);
+-    {
+-        std::vector<VkMat> bindings(2);
+-        bindings[0] = bottom_top_blob;
+-        bindings[1] = square_workspace;
+-
+-        std::vector<vk_constant_type> constants(4);
+-        constants[0].i = w;
+-        constants[1].i = h;
+-        constants[2].i = channels;
+-        constants[3].i = cstep;
+-
+-        const Pipeline* pipe_sq = elempack == 4 ? pipeline_rmsnorm_square_pack4 : pipeline_rmsnorm_square;
+-
+-        cmd.record_pipeline(pipe_sq, bindings, constants, square_workspace);
+-    }
+-
+-    // 2) reduce sum4 (square) -> ... -> mean
++    // 1) Reduce x^2 directly into FP32, avoiding FP16 square overflow and a full-size workspace.
+     VkMat rms_workspace(num_groups_total, 4u * elempack, elempack, opt.workspace_vkallocator);
+     {
+         int reduced_w = (group_size + 3) / 4;
+@@ -223,14 +188,14 @@ int RMSNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, cons
+
+         {
+             std::vector<VkMat> bindings(2);
+-            bindings[0] = square_workspace;
++            bindings[0] = bottom_top_blob;
+             bindings[1] = sqsum_workspace;
+
+             std::vector<vk_constant_type> constants(8);
+             constants[0].i = group_size;
+             constants[1].i = num_groups_per_channel;
+             constants[2].i = channels;
+-            constants[3].i = square_workspace.cstep;
++            constants[3].i = cstep;
+             constants[4].i = reduced_w;
+             constants[5].i = num_groups_per_channel;
+             constants[6].i = channels;
+@@ -240,8 +205,8 @@ int RMSNorm_vulkan::forward_inplace(VkMat& bottom_top_blob, VkCompute& cmd, cons
+             dispatcher.w = reduced_w;
+             dispatcher.h = num_groups_per_channel;
+             dispatcher.c = channels;
+-            const Pipeline* p_reduce = elempack == 4 ? pipeline_rmsnorm_reduce_sum4_fp16_to_fp32_pack4
+-                                       : pipeline_rmsnorm_reduce_sum4_fp16_to_fp32;
++            const Pipeline* p_reduce = elempack == 4 ? pipeline_rmsnorm_reduce_sum4_pack4
++                                       : pipeline_rmsnorm_reduce_sum4;
+             cmd.record_pipeline(p_reduce, bindings, constants, dispatcher);
+         }
+         int pb = 1;
+diff --git a/src/layer/vulkan/rmsnorm_vulkan.h b/src/layer/vulkan/rmsnorm_vulkan.h
+index 78ce5f9a..7d8628fa 100644
+--- a/src/layer/vulkan/rmsnorm_vulkan.h
++++ b/src/layer/vulkan/rmsnorm_vulkan.h
+@@ -25,16 +25,14 @@ public:
+     VkMat gamma_data_gpu;
+
+     // pack1
+-    Pipeline* pipeline_rmsnorm_square; // x -> x^2
+-    Pipeline* pipeline_rmsnorm_reduce_sum4_fp16_to_fp32;
++    Pipeline* pipeline_rmsnorm_reduce_sum4;
+     Pipeline* pipeline_rmsnorm_reduce_sum4_fp32[2];
+     Pipeline* pipeline_rmsnorm_reduce_mean;
+     Pipeline* pipeline_rmsnorm_coeffs;
+     Pipeline* pipeline_rmsnorm_norm;
+
+     // pack4
+-    Pipeline* pipeline_rmsnorm_square_pack4;
+-    Pipeline* pipeline_rmsnorm_reduce_sum4_fp16_to_fp32_pack4;
++    Pipeline* pipeline_rmsnorm_reduce_sum4_pack4;
+     Pipeline* pipeline_rmsnorm_reduce_sum4_fp32_pack4[2];
+     Pipeline* pipeline_rmsnorm_reduce_mean_pack4;
+     Pipeline* pipeline_rmsnorm_coeffs_pack4;
+diff --git a/src/layer/vulkan/shader/rmsnorm_square.comp b/src/layer/vulkan/shader/rmsnorm_square.comp
+deleted file mode 100644
+index 48d7aa35..00000000
+--- a/src/layer/vulkan/shader/rmsnorm_square.comp
++++ /dev/null
+@@ -1,28 +0,0 @@
+-// Copyright 2025 Futz12 <pchar.cn>
+-// SPDX-License-Identifier: BSD-3-Clause
+-
+-#version 450
+-
+-layout(binding = 0) readonly buffer bottom_top_blob { sfp bottom_top_blob_data[]; };
+-layout(binding = 1) writeonly buffer square_blob { sfp square_blob_data[]; };
+-
+-layout(push_constant) uniform parameter
+-{
+-    int w;
+-    int h;
+-    int c;
+-    int cstep;
+-} p;
+-
+-void main()
+-{
+-    int gx = int(gl_GlobalInvocationID.x);
+-    int gy = int(gl_GlobalInvocationID.y);
+-    int gz = int(gl_GlobalInvocationID.z);
+-    if (gx >= p.w || gy >= p.h || gz >= p.c)
+-        return;
+-
+-    int idx = gz * p.cstep + gy * p.w + gx;
+-    float v = float(buffer_ld1(bottom_top_blob_data, idx));
+-    buffer_st1(square_blob_data, idx, afp(v * v));
+-}
+diff --git a/src/layer/vulkan/shader/rmsnorm_square_pack4.comp b/src/layer/vulkan/shader/rmsnorm_square_pack4.comp
+deleted file mode 100644
+index d256f701..00000000
+--- a/src/layer/vulkan/shader/rmsnorm_square_pack4.comp
++++ /dev/null
+@@ -1,29 +0,0 @@
+-// Copyright 2025 Futz12 <pchar.cn>
+-// SPDX-License-Identifier: BSD-3-Clause
+-
+-#version 450
+-
+-layout(binding = 0) readonly buffer bottom_top_blob { sfpvec4 bottom_top_blob_data[]; };
+-layout(binding = 1) writeonly buffer square_blob { sfpvec4 square_blob_data[]; };
+-
+-layout(push_constant) uniform parameter
+-{
+-    int w;
+-    int h;
+-    int c;
+-    int cstep;
+-} p;
+-
+-void main()
+-{
+-    int gx = int(gl_GlobalInvocationID.x);
+-    int gy = int(gl_GlobalInvocationID.y);
+-    int gz = int(gl_GlobalInvocationID.z);
+-
+-    if (gx >= p.w || gy >= p.h || gz >= p.c)
+-        return;
+-
+-    int idx = gz * p.cstep + gy * p.w + gx;
+-    vec4 v = vec4(buffer_ld4(bottom_top_blob_data, idx));
+-    buffer_st4(square_blob_data, idx, afpvec4(v * v));
+-}
+diff --git a/src/layer/vulkan/shader/rmsnorm_reduce_sum4.comp b/src/layer/vulkan/shader/rmsnorm_reduce_sum4.comp
+new file mode 100644
+index 00000000..5efb31ee
+--- /dev/null
++++ b/src/layer/vulkan/shader/rmsnorm_reduce_sum4.comp
+@@ -0,0 +1,64 @@
++// Copyright 2025 Futz12 <pchar.cn>
++// SPDX-License-Identifier: BSD-3-Clause
++
++#version 450
++
++layout(binding = 0) readonly buffer bottom_top_blob { sfp bottom_top_blob_data[]; };
++layout(binding = 1) writeonly buffer sum_blob { float sum_blob_data[]; };
++
++layout(push_constant) uniform parameter
++{
++    int w;
++    int h;
++    int c;
++    int cstep;
++
++    int outw;
++    int outh;
++    int outc;
++    int outcstep;
++} p;
++
++void main()
++{
++    int gx = int(gl_GlobalInvocationID.x);
++    int gy = int(gl_GlobalInvocationID.y);
++    int gz = int(gl_GlobalInvocationID.z);
++
++    if (gx >= p.outw || gy >= p.outh || gz >= p.outc)
++        return;
++
++    int sx = gx * 4;
++    int v_offset = gz * p.cstep + gy * p.w + sx;
++    float sum = 0.f;
++
++    if (sx == p.w - 1)
++    {
++        float v = float(buffer_ld1(bottom_top_blob_data, v_offset));
++        sum = v * v;
++    }
++    else if (sx == p.w - 2)
++    {
++        float v0 = float(buffer_ld1(bottom_top_blob_data, v_offset));
++        float v1 = float(buffer_ld1(bottom_top_blob_data, v_offset + 1));
++        sum = v0 * v0 + v1 * v1;
++    }
++    else if (sx == p.w - 3)
++    {
++        float v0 = float(buffer_ld1(bottom_top_blob_data, v_offset));
++        float v1 = float(buffer_ld1(bottom_top_blob_data, v_offset + 1));
++        float v2 = float(buffer_ld1(bottom_top_blob_data, v_offset + 2));
++        sum = v0 * v0 + v1 * v1 + v2 * v2;
++    }
++    else
++    {
++        float v0 = float(buffer_ld1(bottom_top_blob_data, v_offset));
++        float v1 = float(buffer_ld1(bottom_top_blob_data, v_offset + 1));
++        float v2 = float(buffer_ld1(bottom_top_blob_data, v_offset + 2));
++        float v3 = float(buffer_ld1(bottom_top_blob_data, v_offset + 3));
++        sum = v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
++    }
++
++    int gi = gz * p.outcstep + gy * p.outw + gx;
++    sum_blob_data[gi] = sum;
++}
+diff --git a/src/layer/vulkan/shader/rmsnorm_reduce_sum4_pack4.comp b/src/layer/vulkan/shader/rmsnorm_reduce_sum4_pack4.comp
+new file mode 100644
+index 00000000..b74595f9
+--- /dev/null
++++ b/src/layer/vulkan/shader/rmsnorm_reduce_sum4_pack4.comp
+@@ -0,0 +1,64 @@
++// Copyright 2025 Futz12 <pchar.cn>
++// SPDX-License-Identifier: BSD-3-Clause
++
++#version 450
++
++layout(binding = 0) readonly buffer bottom_top_blob { sfpvec4 bottom_top_blob_data[]; };
++layout(binding = 1) writeonly buffer sum_blob { vec4 sum_blob_data[]; };
++
++layout(push_constant) uniform parameter
++{
++    int w;
++    int h;
++    int c;
++    int cstep;
++
++    int outw;
++    int outh;
++    int outc;
++    int outcstep;
++} p;
++
++void main()
++{
++    int gx = int(gl_GlobalInvocationID.x);
++    int gy = int(gl_GlobalInvocationID.y);
++    int gz = int(gl_GlobalInvocationID.z);
++
++    if (gx >= p.outw || gy >= p.outh || gz >= p.outc)
++        return;
++
++    int sx = gx * 4;
++    int v_offset = gz * p.cstep + gy * p.w + sx;
++    vec4 sum = vec4(0.f);
++
++    if (sx == p.w - 1)
++    {
++        vec4 v = vec4(buffer_ld4(bottom_top_blob_data, v_offset));
++        sum = v * v;
++    }
++    else if (sx == p.w - 2)
++    {
++        vec4 v0 = vec4(buffer_ld4(bottom_top_blob_data, v_offset));
++        vec4 v1 = vec4(buffer_ld4(bottom_top_blob_data, v_offset + 1));
++        sum = v0 * v0 + v1 * v1;
++    }
++    else if (sx == p.w - 3)
++    {
++        vec4 v0 = vec4(buffer_ld4(bottom_top_blob_data, v_offset));
++        vec4 v1 = vec4(buffer_ld4(bottom_top_blob_data, v_offset + 1));
++        vec4 v2 = vec4(buffer_ld4(bottom_top_blob_data, v_offset + 2));
++        sum = v0 * v0 + v1 * v1 + v2 * v2;
++    }
++    else
++    {
++        vec4 v0 = vec4(buffer_ld4(bottom_top_blob_data, v_offset));
++        vec4 v1 = vec4(buffer_ld4(bottom_top_blob_data, v_offset + 1));
++        vec4 v2 = vec4(buffer_ld4(bottom_top_blob_data, v_offset + 2));
++        vec4 v3 = vec4(buffer_ld4(bottom_top_blob_data, v_offset + 3));
++        sum = v0 * v0 + v1 * v1 + v2 * v2 + v3 * v3;
++    }
++
++    int gi = gz * p.outcstep + gy * p.outw + gx;
++    sum_blob_data[gi] = sum;
++}

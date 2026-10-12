@@ -61,11 +61,12 @@ static ncnn::Mat bgr_to_rgb_chw_normalized(const ncnn::Mat& bgr, int target_w, i
 // ============================================================================
 ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
                                                  bool use_vulkan, int num_threads,
-                                                 int vulkan_device, bool use_fp16,
+                                                 int vulkan_device, VulkanStorageType storage_type,
                                                  bool weights_in_host,
                                                  bool vision_use_vulkan)
     : ncnn_llm_base(use_vulkan, num_threads > 0 ? num_threads : 4,
-                    vulkan_device, use_fp16, weights_in_host) {
+                    vulkan_device, storage_type, weights_in_host) {
+    if (!ncnn_llm_base::ok_) return;
     try {
         json config;
         {
@@ -81,8 +82,7 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
 
         // 视觉后端开关：--vision-vulkan（或 LA_VISION_VK=1）可让视觉 3 子图走 Vulkan；
         // 但 Vulkan 必须先由 --vulkan 开启（否则设备未初始化，开关无效、视觉仍 CPU）。
-        // 精度统一由 create_option() 按 --fp16 控制，不在此写死：--fp16 现走
-        // zimage 方案（2 字节存储 bf16/fp16 + 计算恒 fp32），对视觉/文本子图一致生效。
+        // 精度由 create_option() 按明确选择的 --fp16 / --bf16 存储类型统一配置。
         const bool vision_switch = vision_use_vulkan
                                    || (getenv("LA_VISION_VK") && atoi(getenv("LA_VISION_VK")) != 0);
         const bool vision_vk = vulkan_ && vision_switch;
@@ -93,7 +93,7 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
         auto load_net = [&](const std::string& key, bool is_vision) {
             auto net = std::make_shared<ncnn::Net>();
             net->opt = create_option();
-            // 仅后端（Vulkan/CPU）随子图不同；精度统一交给 create_option（受 --fp16 控制）。
+            // 仅后端（Vulkan/CPU）随子图不同；存储类型统一交给 create_option。
             net->opt.use_vulkan_compute = is_vision ? vision_vk : vulkan_;
             std::string p = model_path + "/" + config["params"][key]["param"].get<std::string>();
             std::string b = model_path + "/" + config["params"][key]["bin"].get<std::string>();
@@ -104,8 +104,7 @@ ncnn_llm_locateanything::ncnn_llm_locateanything(const std::string& model_path,
             }
             return net;
         };
-        // 视觉链：默认 CPU，--vision-vulkan 时切 Vulkan；精度与文本一致由 --fp16 控制。
-        // (zimage 方案：fp16 算术已关闭，--fp16 仅启用 2 字节存储，计算恒 fp32）
+        // 视觉链：默认 CPU，--vision-vulkan 时切 Vulkan；精度与文本链一致。
         net_vision_embed_    = load_net("vision_embed", /*is_vision=*/true);
         net_vision_encoder_  = load_net("vision_encoder", /*is_vision=*/true);
         net_vision_projector_ = load_net("vision_projector", /*is_vision=*/true);
@@ -417,8 +416,18 @@ ncnn::Mat ncnn_llm_locateanything::run_text_embed(const std::vector<int>& ids) {
     ncnn::Mat out;
     ncnn::Extractor ex = net_text_embed_->create_extractor();
     ex.input("in0", in);
-    ex.extract("out0", out);
-    return la_canonical_2d(out, hidden_, "text_embed.out0");
+    if (ex.extract("out0", out) != 0 || out.empty()) {
+        fprintf(stderr, "[locateanything] ERROR text_embed.out0 extraction failed\n");
+        ok_ = false;
+        return ncnn::Mat();
+    }
+    out = la_canonical_2d(out, hidden_, "text_embed.out0");
+    if (out.empty() || out.dims != 2 || out.w != hidden_) {
+        fprintf(stderr, "[locateanything] ERROR text_embed.out0 has invalid shape\n");
+        ok_ = false;
+        return ncnn::Mat();
+    }
+    return out;
 }
 
 ncnn::Mat ncnn_llm_locateanything::run_decoder(const ncnn::Mat& emb, const ncnn::Mat& cos,
@@ -450,10 +459,25 @@ ncnn::Mat ncnn_llm_locateanything::run_decoder(const ncnn::Mat& emb, const ncnn:
     // KV 输出
     for (int i = 0; i < layers_; i++) {
         ncnn::Mat ok_, ov_;
-        ex.extract(("out_cache_k" + std::to_string(i)).c_str(), ok_);
-        ex.extract(("out_cache_v" + std::to_string(i)).c_str(), ov_);
+        const std::string key_name = "out_cache_k" + std::to_string(i);
+        const std::string value_name = "out_cache_v" + std::to_string(i);
+        if (ex.extract(key_name.c_str(), ok_) != 0 || ok_.empty()) {
+            fprintf(stderr, "[locateanything] ERROR %s extraction failed\n", key_name.c_str());
+            this->ok_ = false;
+            return ncnn::Mat();
+        }
+        if (ex.extract(value_name.c_str(), ov_) != 0 || ov_.empty()) {
+            fprintf(stderr, "[locateanything] ERROR %s extraction failed\n", value_name.c_str());
+            this->ok_ = false;
+            return ncnn::Mat();
+        }
         ok_ = la_canonical_kv(ok_, "decoder.out_cache_k");
         ov_ = la_canonical_kv(ov_, "decoder.out_cache_v");
+        if (ok_.dims != 3 || ov_.dims != 3 || ok_.elempack != 1 || ov_.elempack != 1) {
+            fprintf(stderr, "[locateanything] ERROR decoder KV output has invalid layout at layer %d\n", i);
+            this->ok_ = false;
+            return ncnn::Mat();
+        }
         if (is_prefill) {
             kv.emplace_back(ok_, ov_);
         } else {
@@ -464,17 +488,37 @@ ncnn::Mat ncnn_llm_locateanything::run_decoder(const ncnn::Mat& emb, const ncnn:
     // 图在首次 KV extract 时已完整前向；want_out=false（prefill）时 out0 只被丢弃，
     // 跳过 extract + 解包/摊平（[hidden,S] 整矩阵拷贝），省去多余的规范化。
     if (!want_out) return ncnn::Mat();
-    ex.extract("out0", out);
-    return la_canonical_2d(out, hidden_, "text_decoder.out0");
+    if (ex.extract("out0", out) != 0 || out.empty()) {
+        fprintf(stderr, "[locateanything] ERROR text_decoder.out0 extraction failed\n");
+        ok_ = false;
+        return ncnn::Mat();
+    }
+    out = la_canonical_2d(out, hidden_, "text_decoder.out0");
+    if (out.empty() || out.dims != 2 || out.w != hidden_) {
+        fprintf(stderr, "[locateanything] ERROR text_decoder.out0 has invalid shape\n");
+        ok_ = false;
+        return ncnn::Mat();
+    }
+    return out;
 }
 
 ncnn::Mat ncnn_llm_locateanything::run_lm_head(const ncnn::Mat& hidden) {
     ncnn::Mat out;
     ncnn::Extractor ex = net_lm_head_->create_extractor();
     ex.input("in0", hidden);
-    ex.extract("out0", out);
+    if (ex.extract("out0", out) != 0 || out.empty()) {
+        fprintf(stderr, "[locateanything] ERROR lm_head.out0 extraction failed\n");
+        ok_ = false;
+        return ncnn::Mat();
+    }
     LA_SHAPE("lm_head.out0", out);
-    return la_unpack(out, "lm_head.out0");
+    out = la_unpack(out, "lm_head.out0");
+    if (out.empty()) {
+        fprintf(stderr, "[locateanything] ERROR lm_head.out0 unpack failed\n");
+        ok_ = false;
+        return ncnn::Mat();
+    }
+    return out;
 }
 
 // ============================================================================
@@ -652,7 +696,6 @@ std::vector<int> ncnn_llm_locateanything::mtp_window_decode(const std::vector<nc
     // x0：每行采样（torch sample_tokens；greedy=argmax）
     std::vector<int> x0(K);
     for (int i = 0; i < K; i++) x0[i] = sample_logits_row(win[i], V, cfg);
-
     std::vector<int> nt;                      // 最终交给 handle_pattern 的 token 序列
 
     // ---- is_valid_box_frame + assemble（decode_bbox_avg, hybrid 阈值 0.7/0.2）----
@@ -717,15 +760,41 @@ std::vector<int> ncnn_llm_locateanything::mtp_window_decode(const std::vector<nc
                              ref_end_id_, null_id_, im_end_id_, none_id_, type);
 }
 
-// 把 KV 的逻辑长度裁到前 rows 行。ncnn x86 SDPA 的 cache 可能是 panel/interleaved
-// layout，不能按普通二维 Mat 逐行 memcpy；保留底层 buffer，只更新逻辑 h 即可丢弃尾部 token。
-static void trim_kv(KVCache& kv, int rows) {
+// Vulkan 缓存从设备提取为标准 pack1 Mat 后，缩短 h 仍会保留更大分配的 cstep。
+// 精确重建 Vulkan cache 的逻辑前缀，避免下次上传/扩容按陈旧 stride 读取。
+// CPU x86 SDPA 可能使用 panel/interleaved layout，仍只修改逻辑 h。
+static bool trim_kv(KVCache& kv, int rows, bool compact_for_vulkan) {
     for (auto& pr : kv) {
-        if (pr.first.h > rows)
-            pr.first.h = rows;
-        if (pr.second.h > rows)
-            pr.second.h = rows;
+        auto trim = [rows, compact_for_vulkan](ncnn::Mat& cache) {
+            if (cache.h <= rows)
+                return true;
+            if (compact_for_vulkan) {
+                if (cache.dims != 3 || cache.elempack != 1 || cache.elemsize != sizeof(float)) {
+                    fprintf(stderr, "[locateanything] ERROR unexpected Vulkan KV layout while trimming\n");
+                    return false;
+                }
+                ncnn::Mat trimmed;
+                trimmed.create(cache.w, rows, cache.c, cache.elemsize, cache.elempack);
+                if (trimmed.empty()) {
+                    fprintf(stderr, "[locateanything] ERROR failed to allocate compact Vulkan KV cache\n");
+                    return false;
+                }
+                for (int c = 0; c < cache.c; c++) {
+                    for (int y = 0; y < rows; y++) {
+                        memcpy(trimmed.channel(c).row(y), cache.channel(c).row(y),
+                               (size_t)cache.w * cache.elemsize);
+                    }
+                }
+                cache = trimmed;
+            } else {
+                cache.h = rows;
+            }
+            return true;
+        };
+        if (!trim(pr.first) || !trim(pr.second))
+            return false;
     }
+    return true;
 }
 
 // MTP 并行窗口 + AR 回退 生成循环。
@@ -755,6 +824,7 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
     // 单 token 因果前向：位置 pos 的真实 token -> 返回该位置 hidden。
     auto decode_single_causal = [&](int tok, int pos) -> ncnn::Mat {
         ncnn::Mat emb = run_text_embed({tok});          // [hidden,1]
+        if (emb.empty()) return ncnn::Mat();
         ncnn::Mat c, s;
         text_rope_cos_sin(1, pos, c, s);
         int past = (int)kv[0].first.h;
@@ -773,11 +843,13 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
             while (cache_len < (int)stream.size()) {
                 int t = stream[cache_len];
                 last_hid = decode_single_causal(t, cache_len);   // 因果单 token 前向，回填 KV
+                if (last_hid.empty()) return;
                 cache_len++;
             }
             int cur = stream.back();
             if (cur == eos_id_ || cur == im_end_id_) break;
             ncnn::Mat lo = run_lm_head(last_hid);
+            if (lo.empty()) return;
             // rep penalty（greedy 时 rep=1 无影响）+ 采样
             ncnn::Mat l2 = lo.clone();
             if (cfg.repetition_penalty != 1.0f) {
@@ -805,9 +877,6 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         // ---- MTP 窗口 ----
         int L = (int)stream.size();
         int past = (int)kv[0].first.h;
-        LA_TRACE("WINSTATE L=%d past=%d cache_len=%d blk=%d kvh(w=%d h=%d c=%d pack=%d)\n",
-                 L, past, cache_len, block_size_, kv[0].first.w, kv[0].first.h, kv[0].first.c,
-                 kv[0].first.elempack);
         // 块 = [未缓存真实 token][rep=stream[-1]][mask_tok × (block-1)]
         std::vector<int> blk;
         for (int i = cache_len; i < L; i++) blk.push_back(stream[i]);
@@ -826,36 +895,38 @@ void ncnn_llm_locateanything::decode_loop_mtp(std::string& out_text, std::vector
         for (int j = 1; j < block_size_; j++) bpos[m++] = L + j;
 
         ncnn::Mat blk_emb = run_text_embed(blk);          // [hidden,K]
+        if (blk_emb.empty()) return;
         ncnn::Mat cos, sin;
         text_rope_cos_sin_at(bpos, cos, sin);
         ncnn::Mat mask = mtp_mask(K, past);
         ncnn::Mat hidden = run_decoder(blk_emb, cos, sin, mask, kv, false);   // [hidden,K]
+        if (hidden.empty()) return;
 
         // 窗口 logits = 最后 block_size_ 行
         int w0 = K - block_size_;
         std::vector<ncnn::Mat> win;
         for (int i = w0; i < K; i++) {
-            win.push_back(run_lm_head(row_of(hidden, i, hidden_)));   // w=vocab
+            ncnn::Mat logits = run_lm_head(row_of(hidden, i, hidden_));   // w=vocab
+            if (logits.empty()) return;
+            win.push_back(logits);
         }
         std::string type;
         std::vector<int> commit = mtp_window_decode(win, type, cfg);
-
-        LA_TRACE("WINDOW type=%s commit=%s stream=%zu limit=%d\n", type.c_str(),
-                 locate_dbg::join_ids(commit).c_str(), stream.size(), limit);
+        const size_t remaining = (size_t)(limit - (int)stream.size());
+        if (commit.size() > remaining || (type == "error_box" && remaining < (size_t)block_size_))
+            break;
 
         for (int t : commit) stream.push_back(t);
         emit(commit);
         if (type == "im_end") break;
-        trim_kv(kv, L);                                   // 丢弃窗口，KV 只留真实 [0:L)
-        LA_TRACE("KVSTAT after-trim rows=%d (w=%d h=%d c=%d pack=%d) expect=%d\n",
-                 (int)kv[0].first.h, kv[0].first.w, kv[0].first.h, kv[0].first.c,
-                 kv[0].first.elempack, L);
+        if (!trim_kv(kv, L, use_vulkan_)) {
+            ok_ = false;
+            return;
+        }
         cache_len = L;                                    // 真实 token 缓存到 L（提交前）
         if (type == "error_box") in_mtp = false;          // 出错 -> AR
         // coord_box / point_box / empty_box / ref_object 继续 MTP
     }
-    LA_TRACE("LOOP-END stream=%zu limit=%d last=%d\n", stream.size(), limit,
-             stream.empty() ? -1 : stream.back());
 }
 
 // 纯逐 token AR 生成循环：每步在增量位置因果前向、采样 1 个新 token 追加进 KV，
@@ -877,6 +948,7 @@ void ncnn_llm_locateanything::decode_loop_ar(std::string& out_text, std::vector<
     // 单 token 因果前向：位置 pos 的真实 token -> 返回该位置 hidden（KV 追加一行）。
     auto decode_single_causal = [&](int tok, int pos) -> ncnn::Mat {
         ncnn::Mat emb = run_text_embed({tok});          // [hidden,1]
+        if (emb.empty()) return ncnn::Mat();
         ncnn::Mat c, s;
         text_rope_cos_sin(1, pos, c, s);
         int past = (int)kv[0].first.h;
@@ -890,8 +962,10 @@ void ncnn_llm_locateanything::decode_loop_ar(std::string& out_text, std::vector<
         int cur = stream.back();
         if (cur == eos_id_ || cur == im_end_id_) break;
         ncnn::Mat hid = decode_single_causal(cur, pos);
+        if (hid.empty()) return;
         pos++;
         ncnn::Mat lo = run_lm_head(hid);
+        if (lo.empty()) return;
         ncnn::Mat l2 = lo.clone();
         if (cfg.repetition_penalty != 1.0f) {
             float* pp = l2;
@@ -906,11 +980,9 @@ void ncnn_llm_locateanything::decode_loop_ar(std::string& out_text, std::vector<
         stream.push_back(next);
         emit({next});
         history.insert(next);
-        LA_TRACE("AR tok=%d (pos=%d)\n", next, pos);   // pos = next 下一轮作为输入时的位置
+
         if (next == eos_id_ || next == im_end_id_) break;
     }
-    LA_TRACE("AR-LOOP-END stream=%zu limit=%d last=%d\n", stream.size(), limit,
-             stream.empty() ? -1 : stream.back());
 }
 
 // 视觉链：embed -> encoder -> 宿主 2x2 patch_merge -> projector。
@@ -1051,6 +1123,11 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     // 1) 视觉特征
     ncnn::Mat image_features;
     run_vision_features(bgr_image, image_features);
+    if (image_features.empty()) {
+        fprintf(stderr, "[locateanything] ERROR vision feature extraction failed\n");
+        return std::string();
+    }
+
 
     // 2) 拼 prompt：system/user + optional image context + question + assistant
     //    与 torch 的 _tokenize 完全一致：user 文本=_PROMPT + question + "."（见
@@ -1089,6 +1166,7 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
 
     // 4) embed + 把视觉特征 scatter 进 <IMG_CONTEXT> 所在行
     ncnn::Mat embed = run_text_embed(ids);               // Mat(hidden, S)
+    if (embed.empty()) return std::string();
     const float* fp = image_features;                     // Mat(hidden, n_image_tokens_)
     if (image_features.w != hidden_) {
         fprintf(stderr, "[locateanything] image feature width unexpected %d\n", image_features.w);
@@ -1099,7 +1177,6 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
         const float* src = fp + (size_t)j * hidden_;
         std::memcpy(dst, src, (size_t)hidden_ * sizeof(float));
     }
-
     // 5) 生成 cos/sin/掩码，prefill 整个序列
     ncnn::Mat cos, sin;
     text_rope_cos_sin(S, 0, cos, sin);
@@ -1109,14 +1186,17 @@ std::string ncnn_llm_locateanything::run(const ncnn::Mat& bgr_image, const std::
     kv.reserve((size_t)layers_ * 2);
     // prefill 只为填 KV cache；out0 后续不使用，跳过其规范化（见 run_decoder want_out）。
     run_decoder(embed, cos, sin, mask, kv, true, false);
+    if (!ok_ || kv.size() != (size_t)layers_) return std::string();
 
     // 6) MTP 并行窗口解码（+ AR 回退），对齐 torch generation_mode='hybrid'。
     //    ids 即 prompt token 流，函数内会追加生成 token；out_text 由回调逐 token 累积。
     std::unordered_set<int> history;
-    if (cfg.use_mtp)
+    if (cfg.use_mtp) {
         decode_loop_mtp(out_text, ids, kv, cfg, history);
-    else
+    } else {
         decode_loop_ar(out_text, ids, kv, cfg, history);
+    }
+    if (!ok_) return std::string();
 
     // 7) 从生成 token 解析检测框（归一化 [0,1]），供调用方打印/画框。
     collect_boxes(ids, (size_t)S);
