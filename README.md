@@ -29,7 +29,7 @@
 | CPU · Intel x86 (Windows) | 默认 CPU 路径 | 默认 fp32 数据路径；实际使用 SSE/AVX 等编译和运行时分派 | ✅ 正确 |
 | CPU · AMD x86 (Linux) | AVX-512 开启/关闭 | 默认 fp32 数据路径；x86 SDPA 的 packed KV cache 经过修复后两种配置均正确 | ✅ 正确 |
 | Vulkan · NVIDIA | fp32 存储 | fp32 存储路径；MTP 与 `--no-mtp` 均已实测 | ✅ 正确 |
-| Vulkan · NVIDIA (5090) | `--bf16` / `--fp16` | 分别强制 BF16 / IEEE FP16 存储；有针对性修复覆盖 | 根因已修复；该卡待复测 |
+| Vulkan · NVIDIA (5090) | `--bf16` / `--fp16` | 分别强制 BF16 / IEEE FP16 存储；有针对性修复覆盖 | ✅ 正确 |
 | Vulkan · NVIDIA (1080Ti) | `--fp16` | 强制 IEEE FP16 存储；不支持 BF16 时 `--bf16` 会明确报错 | ✅ 正确 |
 | Vulkan · Apple M1 Pro (MoltenVK) | fp32 存储 | 完整 `football.jpg` prompt 触发 `vkWaitForFences failed -4`；在 `3cfacf1` 上同样复现 | ⚠️ 长 prompt device lost |
 | Vulkan · Apple M1 Pro (MoltenVK) | `--fp16 --max-new-tokens 9` | IEEE FP16 MTP 修复 cache stride 后输出完整框 | ✅ 正确 |
